@@ -1,0 +1,3549 @@
+"use strict";
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+const common_1 = require("@google-cloud/common");
+const assert = require("assert");
+const mocha_1 = require("mocha");
+const crypto = require("crypto");
+const dateFormat = require("date-and-time");
+const duplexify = require("duplexify");
+const extend = require("extend");
+const fs = require("fs");
+const resumableUpload = require("gcs-resumable-upload");
+const proxyquire = require("proxyquire");
+const sinon = require("sinon");
+const stream_1 = require("stream");
+const tmp = require("tmp");
+const zlib = require("zlib");
+const gaxios = require("gaxios");
+const src_1 = require("../src");
+const file_1 = require("../src/file");
+class HTTPError extends Error {
+    constructor(message, code) {
+        super(message);
+        this.code = code;
+    }
+}
+let promisified = false;
+let makeWritableStreamOverride;
+let handleRespOverride;
+const fakeUtil = Object.assign({}, common_1.util, {
+    handleResp(...args) {
+        (handleRespOverride || common_1.util.handleResp)(...args);
+    },
+    makeWritableStream(...args) {
+        (makeWritableStreamOverride || common_1.util.makeWritableStream)(...args);
+    },
+    shouldRetryRequest(err) {
+        return err.code === 500;
+    },
+});
+const fakePromisify = {
+    // tslint:disable-next-line:variable-name
+    promisifyAll(Class, options) {
+        if (Class.name !== 'File') {
+            return;
+        }
+        promisified = true;
+        assert.deepStrictEqual(options.exclude, [
+            'publicUrl',
+            'request',
+            'save',
+            'setEncryptionKey',
+        ]);
+    },
+};
+const fsCached = extend(true, {}, fs);
+const fakeFs = extend(true, {}, fsCached);
+const zlibCached = extend(true, {}, zlib);
+let createGunzipOverride;
+const fakeZlib = extend(true, {}, zlib, {
+    createGunzip(...args) {
+        return (createGunzipOverride || zlibCached.createGunzip)(...args);
+    },
+});
+let hashStreamValidationOverride;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const hashStreamValidation = require('hash-stream-validation');
+function fakeHashStreamValidation(...args) {
+    return (hashStreamValidationOverride || hashStreamValidation)(...args);
+}
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const osCached = extend(true, {}, require('os'));
+const fakeOs = extend(true, {}, osCached);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let resumableUploadOverride;
+function fakeResumableUpload() {
+    return () => {
+        return resumableUploadOverride || resumableUpload;
+    };
+}
+Object.assign(fakeResumableUpload, {
+    createURI(...args) {
+        let createURI = resumableUpload.createURI;
+        if (resumableUploadOverride && resumableUploadOverride.createURI) {
+            createURI = resumableUploadOverride.createURI;
+        }
+        return createURI(...args);
+    },
+});
+Object.assign(fakeResumableUpload, {
+    upload(...args) {
+        let upload = resumableUpload.upload;
+        if (resumableUploadOverride && resumableUploadOverride.upload) {
+            upload = resumableUploadOverride.upload;
+        }
+        return upload(...args);
+    },
+});
+class FakeServiceObject extends common_1.ServiceObject {
+    constructor(config) {
+        super(config);
+        // eslint-disable-next-line prefer-rest-params
+        this.calledWith_ = arguments;
+    }
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let xdgConfigOverride;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const xdgBasedirCached = require('xdg-basedir');
+const fakeXdgBasedir = extend(true, {}, xdgBasedirCached);
+Object.defineProperty(fakeXdgBasedir, 'config', {
+    get() {
+        return xdgConfigOverride === false
+            ? false
+            : xdgConfigOverride || xdgBasedirCached.config;
+    },
+});
+const fakeSigner = {
+    URLSigner: () => { },
+};
+mocha_1.describe('File', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let File;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let file;
+    const FILE_NAME = 'file-name.png';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let directoryFile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let specialCharsFile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let STORAGE;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let BUCKET;
+    mocha_1.before(() => {
+        File = proxyquire('../src/file.js', {
+            '@google-cloud/common': {
+                ServiceObject: FakeServiceObject,
+                util: fakeUtil,
+            },
+            '@google-cloud/promisify': fakePromisify,
+            fs: fakeFs,
+            'gcs-resumable-upload': fakeResumableUpload,
+            'hash-stream-validation': fakeHashStreamValidation,
+            os: fakeOs,
+            './signer': fakeSigner,
+            'xdg-basedir': fakeXdgBasedir,
+            zlib: fakeZlib,
+        }).File;
+    });
+    mocha_1.beforeEach(() => {
+        extend(true, fakeFs, fsCached);
+        extend(true, fakeOs, osCached);
+        xdgConfigOverride = null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        FakeServiceObject.prototype.request = common_1.util.noop;
+        STORAGE = {
+            createBucket: common_1.util.noop,
+            request: common_1.util.noop,
+            apiEndpoint: 'https://storage.googleapis.com',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeAuthenticatedRequest(req, callback) {
+                if (callback) {
+                    (callback.onAuthenticated || callback)(null, req);
+                }
+            },
+            bucket(name) {
+                return new src_1.Bucket(this, name);
+            },
+        };
+        BUCKET = new src_1.Bucket(STORAGE, 'bucket-name');
+        BUCKET.getRequestInterceptors = () => [];
+        file = new File(BUCKET, FILE_NAME);
+        directoryFile = new File(BUCKET, 'directory/file.jpg');
+        directoryFile.request = common_1.util.noop;
+        specialCharsFile = new File(BUCKET, "special/azAZ!*'()*%/file.jpg");
+        specialCharsFile.request = common_1.util.noop;
+        createGunzipOverride = null;
+        handleRespOverride = null;
+        hashStreamValidationOverride = null;
+        makeWritableStreamOverride = null;
+        resumableUploadOverride = null;
+    });
+    mocha_1.describe('initialization', () => {
+        mocha_1.it('should promisify all the things', () => {
+            assert(promisified);
+        });
+        mocha_1.it('should assign file name', () => {
+            assert.strictEqual(file.name, FILE_NAME);
+        });
+        mocha_1.it('should assign the bucket instance', () => {
+            assert.strictEqual(file.bucket, BUCKET);
+        });
+        mocha_1.it('should assign the storage instance', () => {
+            assert.strictEqual(file.storage, BUCKET.storage);
+        });
+        mocha_1.it('should not strip leading slashes', () => {
+            const file = new File(BUCKET, '/name');
+            assert.strictEqual(file.name, '/name');
+        });
+        mocha_1.it('should assign KMS key name', () => {
+            const kmsKeyName = 'kms-key-name';
+            const file = new File(BUCKET, '/name', { kmsKeyName });
+            assert.strictEqual(file.kmsKeyName, kmsKeyName);
+        });
+        mocha_1.it('should accept specifying a generation', () => {
+            const file = new File(BUCKET, 'name', { generation: 2 });
+            assert.strictEqual(file.generation, 2);
+        });
+        mocha_1.it('should inherit from ServiceObject', () => {
+            // Using assert.strictEqual instead of assert to prevent
+            // coercing of types.
+            assert.strictEqual(file instanceof common_1.ServiceObject, true);
+            const calledWith = file.calledWith_[0];
+            assert.strictEqual(calledWith.parent, BUCKET);
+            assert.strictEqual(calledWith.baseUrl, '/o');
+            assert.strictEqual(calledWith.id, encodeURIComponent(FILE_NAME));
+            assert.deepStrictEqual(calledWith.methods, {
+                delete: { reqOpts: { qs: {} } },
+                exists: { reqOpts: { qs: {} } },
+                get: { reqOpts: { qs: {} } },
+                getMetadata: { reqOpts: { qs: {} } },
+                setMetadata: { reqOpts: { qs: {} } },
+            });
+        });
+        mocha_1.it('should set the correct query string with a generation', () => {
+            const options = { generation: 2 };
+            const file = new File(BUCKET, 'name', options);
+            const calledWith = file.calledWith_[0];
+            assert.deepStrictEqual(calledWith.methods, {
+                delete: { reqOpts: { qs: options } },
+                exists: { reqOpts: { qs: options } },
+                get: { reqOpts: { qs: options } },
+                getMetadata: { reqOpts: { qs: options } },
+                setMetadata: { reqOpts: { qs: options } },
+            });
+        });
+        mocha_1.it('should set the correct query string with a userProject', () => {
+            const options = { userProject: 'user-project' };
+            const file = new File(BUCKET, 'name', options);
+            const calledWith = file.calledWith_[0];
+            assert.deepStrictEqual(calledWith.methods, {
+                delete: { reqOpts: { qs: options } },
+                exists: { reqOpts: { qs: options } },
+                get: { reqOpts: { qs: options } },
+                getMetadata: { reqOpts: { qs: options } },
+                setMetadata: { reqOpts: { qs: options } },
+            });
+        });
+        mocha_1.it('should not strip leading slash name in ServiceObject', () => {
+            const file = new File(BUCKET, '/name');
+            const calledWith = file.calledWith_[0];
+            assert.strictEqual(calledWith.id, encodeURIComponent('/name'));
+        });
+        mocha_1.it('should set a custom encryption key', done => {
+            const key = 'key';
+            const setEncryptionKey = File.prototype.setEncryptionKey;
+            File.prototype.setEncryptionKey = (key_) => {
+                File.prototype.setEncryptionKey = setEncryptionKey;
+                assert.strictEqual(key_, key);
+                done();
+            };
+            new File(BUCKET, FILE_NAME, { encryptionKey: key });
+        });
+        mocha_1.describe('userProject', () => {
+            const USER_PROJECT = 'grapce-spaceship-123';
+            mocha_1.it('should localize the Bucket#userProject', () => {
+                const bucket = new src_1.Bucket(STORAGE, 'bucket-name', {
+                    userProject: USER_PROJECT,
+                });
+                const file = new File(bucket, '/name');
+                assert.strictEqual(file.userProject, USER_PROJECT);
+            });
+            mocha_1.it('should accept a userProject option', () => {
+                const file = new File(BUCKET, '/name', {
+                    userProject: USER_PROJECT,
+                });
+                assert.strictEqual(file.userProject, USER_PROJECT);
+            });
+        });
+    });
+    mocha_1.describe('copy', () => {
+        mocha_1.it('should throw if no destination is provided', () => {
+            assert.throws(() => {
+                file.copy();
+            }, /Destination file should have a name\./);
+        });
+        mocha_1.it('should URI encode file names', done => {
+            const newFile = new File(BUCKET, 'nested/file.jpg');
+            const expectedPath = `/rewriteTo/b/${file.bucket.name}/o/${encodeURIComponent(newFile.name)}`;
+            directoryFile.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.uri, expectedPath);
+                done();
+            };
+            directoryFile.copy(newFile);
+        });
+        mocha_1.it('should execute callback with error & API response', done => {
+            const error = new Error('Error.');
+            const apiResponse = {};
+            const newFile = new File(BUCKET, 'new-file');
+            file.request = (reqOpts, callback) => {
+                callback(error, apiResponse);
+            };
+            file.copy(newFile, (err, file, apiResponse_) => {
+                assert.strictEqual(err, error);
+                assert.strictEqual(file, null);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+        mocha_1.it('should send query.sourceGeneration if File has one', done => {
+            const versionedFile = new File(BUCKET, 'name', { generation: 1 });
+            const newFile = new File(BUCKET, 'new-file');
+            versionedFile.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.sourceGeneration, 1);
+                done();
+            };
+            versionedFile.copy(newFile, assert.ifError);
+        });
+        mocha_1.it('should accept an options object', done => {
+            const newFile = new File(BUCKET, 'name');
+            const options = {
+                option: true,
+            };
+            file.request = (reqOpts) => {
+                assert.deepStrictEqual(reqOpts.json, options);
+                done();
+            };
+            file.copy(newFile, options, assert.ifError);
+        });
+        mocha_1.it('should pass through userProject', done => {
+            const options = {
+                userProject: 'user-project',
+            };
+            const originalOptions = Object.assign({}, options);
+            const newFile = new File(BUCKET, 'new-file');
+            file.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.userProject, options.userProject);
+                assert.strictEqual(reqOpts.json.userProject, undefined);
+                assert.deepStrictEqual(options, originalOptions);
+                done();
+            };
+            file.copy(newFile, options, assert.ifError);
+        });
+        mocha_1.it('should set correct headers when file is encrypted', done => {
+            file.encryptionKey = {};
+            file.encryptionKeyBase64 = 'base64';
+            file.encryptionKeyHash = 'hash';
+            const newFile = new File(BUCKET, 'new-file');
+            file.request = (reqOpts) => {
+                assert.deepStrictEqual(reqOpts.headers, {
+                    'x-goog-copy-source-encryption-algorithm': 'AES256',
+                    'x-goog-copy-source-encryption-key': file.encryptionKeyBase64,
+                    'x-goog-copy-source-encryption-key-sha256': file.encryptionKeyHash,
+                });
+                done();
+            };
+            file.copy(newFile, assert.ifError);
+        });
+        mocha_1.it('should set encryption key on the new File instance', done => {
+            const newFile = new File(BUCKET, 'new-file');
+            newFile.encryptionKey = 'encryptionKey';
+            file.setEncryptionKey = (encryptionKey) => {
+                assert.strictEqual(encryptionKey, newFile.encryptionKey);
+                done();
+            };
+            file.copy(newFile, assert.ifError);
+        });
+        mocha_1.it('should set destination KMS key name', done => {
+            const newFile = new File(BUCKET, 'new-file');
+            newFile.kmsKeyName = 'kms-key-name';
+            file.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.destinationKmsKeyName, newFile.kmsKeyName);
+                assert.strictEqual(file.kmsKeyName, newFile.kmsKeyName);
+                done();
+            };
+            file.copy(newFile, assert.ifError);
+        });
+        mocha_1.it('should set destination KMS key name from option', done => {
+            const newFile = new File(BUCKET, 'new-file');
+            const destinationKmsKeyName = 'destination-kms-key-name';
+            file.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.destinationKmsKeyName, destinationKmsKeyName);
+                assert.strictEqual(file.kmsKeyName, destinationKmsKeyName);
+                done();
+            };
+            file.copy(newFile, { destinationKmsKeyName }, assert.ifError);
+        });
+        mocha_1.it('should accept predefined Acl', done => {
+            const options = {
+                predefinedAcl: 'authenticatedRead',
+            };
+            const newFile = new File(BUCKET, 'new-file');
+            file.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.destinationPredefinedAcl, options.predefinedAcl);
+                assert.strictEqual(reqOpts.json.destinationPredefinedAcl, undefined);
+                done();
+            };
+            file.copy(newFile, options, assert.ifError);
+        });
+        mocha_1.it('should favor the option over the File KMS name', done => {
+            const newFile = new File(BUCKET, 'new-file');
+            newFile.kmsKeyName = 'incorrect-kms-key-name';
+            const destinationKmsKeyName = 'correct-kms-key-name';
+            file.request = (reqOpts) => {
+                assert.strictEqual(reqOpts.qs.destinationKmsKeyName, destinationKmsKeyName);
+                assert.strictEqual(file.kmsKeyName, destinationKmsKeyName);
+                done();
+            };
+            file.copy(newFile, { destinationKmsKeyName }, assert.ifError);
+        });
+        mocha_1.it('should remove custom encryption interceptor if rotating to KMS', done => {
+            const newFile = new File(BUCKET, 'new-file');
+            const destinationKmsKeyName = 'correct-kms-key-name';
+            file.encryptionKeyInterceptor = {};
+            file.interceptors = [{}, file.encryptionKeyInterceptor, {}];
+            file.request = () => {
+                assert.strictEqual(file.interceptors.length, 2);
+                assert(file.interceptors.indexOf(file.encryptionKeyInterceptor) === -1);
+                done();
+            };
+            file.copy(newFile, { destinationKmsKeyName }, assert.ifError);
+        });
+        mocha_1.describe('destination types', () => {
+            function assertPathEquals(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file, expectedPath, callback) {
+                file.request = (reqOpts) => {
+                    assert.strictEqual(reqOpts.uri, expectedPath);
+                    callback();
+                };
+            }
+            mocha_1.it('should allow a string', done => {
+                const newFileName = 'new-file-name.png';
+                const newFile = new File(BUCKET, newFileName);
+                const expectedPath = `/rewriteTo/b/${file.bucket.name}/o/${newFile.name}`;
+                assertPathEquals(file, expectedPath, done);
+                file.copy(newFileName);
+            });
+            mocha_1.it('should allow a string with leading slash.', done => {
+                const newFileName = '/new-file-name.png';
+                const newFile = new File(BUCKET, newFileName);
+                // File uri encodes file name when calling this.request during copy
+                const expectedPath = `/rewriteTo/b/${file.bucket.name}/o/${encodeURIComponent(newFile.name)}`;
+                assertPathEquals(file, expectedPath, done);
+                file.copy(newFileName);
+            });
+            mocha_1.it('should allow a "gs://..." string', done => {
+                const newFileName = 'gs://other-bucket/new-file-name.png';
+                const expectedPath = '/rewriteTo/b/other-bucket/o/new-file-name.png';
+                assertPathEquals(file, expectedPath, done);
+                file.copy(newFileName);
+            });
+            mocha_1.it('should allow a Bucket', done => {
+                const expectedPath = `/rewriteTo/b/${BUCKET.name}/o/${file.name}`;
+                assertPathEquals(file, expectedPath, done);
+                file.copy(BUCKET);
+            });
+            mocha_1.it('should allow a File', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                const expectedPath = `/rewriteTo/b/${BUCKET.name}/o/${newFile.name}`;
+                assertPathEquals(file, expectedPath, done);
+                file.copy(newFile);
+            });
+            mocha_1.it('should throw if a destination cannot be parsed', () => {
+                assert.throws(() => {
+                    file.copy(() => { });
+                }, /Destination file should have a name\./);
+            });
+        });
+        mocha_1.describe('not finished copying', () => {
+            const apiResponse = {
+                rewriteToken: '...',
+            };
+            mocha_1.beforeEach(() => {
+                file.request = (reqOpts, callback) => {
+                    callback(null, apiResponse);
+                };
+            });
+            mocha_1.it('should continue attempting to copy', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                file.request = (reqOpts, callback) => {
+                    file.copy = (newFile_, options, callback) => {
+                        assert.strictEqual(newFile_, newFile);
+                        assert.deepStrictEqual(options, { token: apiResponse.rewriteToken });
+                        callback(); // done()
+                    };
+                    callback(null, apiResponse);
+                };
+                file.copy(newFile, done);
+            });
+            mocha_1.it('should pass the userProject in subsequent requests', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                const fakeOptions = {
+                    userProject: 'grapce-spaceship-123',
+                };
+                file.request = (reqOpts, callback) => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    file.copy = (newFile_, options) => {
+                        assert.notStrictEqual(options, fakeOptions);
+                        assert.strictEqual(options.userProject, fakeOptions.userProject);
+                        done();
+                    };
+                    callback(null, apiResponse);
+                };
+                file.copy(newFile, fakeOptions, assert.ifError);
+            });
+            mocha_1.it('should pass the KMS key name in subsequent requests', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                const fakeOptions = {
+                    destinationKmsKeyName: 'kms-key-name',
+                };
+                file.request = (reqOpts, callback) => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    file.copy = (newFile_, options) => {
+                        assert.strictEqual(options.destinationKmsKeyName, fakeOptions.destinationKmsKeyName);
+                        done();
+                    };
+                    callback(null, apiResponse);
+                };
+                file.copy(newFile, fakeOptions, assert.ifError);
+            });
+            mocha_1.it('should make the subsequent correct API request', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                file.request = (reqOpts) => {
+                    assert.strictEqual(reqOpts.qs.rewriteToken, apiResponse.rewriteToken);
+                    done();
+                };
+                file.copy(newFile, { token: apiResponse.rewriteToken }, assert.ifError);
+            });
+        });
+        mocha_1.describe('returned File object', () => {
+            mocha_1.beforeEach(() => {
+                const resp = { success: true };
+                file.request = (reqOpts, callback) => {
+                    callback(null, resp);
+                };
+            });
+            mocha_1.it('should re-use file object if one is provided', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                file.copy(newFile, (err, copiedFile) => {
+                    assert.ifError(err);
+                    assert.deepStrictEqual(copiedFile, newFile);
+                    done();
+                });
+            });
+            mocha_1.it('should create new file on the same bucket', done => {
+                const newFilename = 'new-filename';
+                file.copy(newFilename, (err, copiedFile) => {
+                    assert.ifError(err);
+                    assert.strictEqual(copiedFile.bucket.name, BUCKET.name);
+                    assert.strictEqual(copiedFile.name, newFilename);
+                    done();
+                });
+            });
+            mocha_1.it('should create new file on the destination bucket', done => {
+                file.copy(BUCKET, (err, copiedFile) => {
+                    assert.ifError(err);
+                    assert.strictEqual(copiedFile.bucket.name, BUCKET.name);
+                    assert.strictEqual(copiedFile.name, file.name);
+                    done();
+                });
+            });
+            mocha_1.it('should pass apiResponse into callback', done => {
+                file.copy(BUCKET, (err, copiedFile, apiResponse) => {
+                    assert.ifError(err);
+                    assert.deepStrictEqual({ success: true }, apiResponse);
+                    done();
+                });
+            });
+        });
+    });
+    mocha_1.describe('createReadStream', () => {
+        function getFakeRequest(data) {
+            let requestOptions;
+            class FakeRequest extends stream_1.Readable {
+                constructor(_requestOptions) {
+                    super();
+                    requestOptions = _requestOptions;
+                    this._read = () => {
+                        if (data) {
+                            this.push(data);
+                        }
+                        this.push(null);
+                    };
+                }
+                static getRequestOptions() {
+                    return requestOptions;
+                }
+            }
+            // Return a Proxy of FakeRequest which can be instantiated
+            // without new.
+            return new Proxy(FakeRequest, {
+                apply(target, _, argumentsList) {
+                    return new target(...argumentsList);
+                },
+            });
+        }
+        function getFakeSuccessfulRequest(data) {
+            // tslint:disable-next-line:variable-name
+            const FakeRequest = getFakeRequest(data);
+            class FakeSuccessfulRequest extends FakeRequest {
+                constructor(req) {
+                    super(req);
+                    setImmediate(() => {
+                        const stream = new FakeRequest();
+                        this.emit('response', stream);
+                    });
+                }
+            }
+            // Return a Proxy of FakeSuccessfulRequest which can be instantiated
+            // without new.
+            return new Proxy(FakeSuccessfulRequest, {
+                apply(target, _, argumentsList) {
+                    return new target(...argumentsList);
+                },
+            });
+        }
+        function getFakeFailedRequest(error) {
+            // tslint:disable-next-line:variable-name
+            const FakeRequest = getFakeRequest();
+            class FakeFailedRequest extends FakeRequest {
+                constructor(_req) {
+                    super(_req);
+                    setImmediate(() => {
+                        this.emit('error', error);
+                    });
+                }
+            }
+            // Return a Proxy of FakeFailedRequest which can be instantiated
+            // without new.
+            return new Proxy(FakeFailedRequest, {
+                apply(target, _, argumentsList) {
+                    return new target(...argumentsList);
+                },
+            });
+        }
+        mocha_1.beforeEach(() => {
+            handleRespOverride = (err, res, body, callback) => {
+                const rawResponseStream = new stream_1.PassThrough();
+                Object.assign(rawResponseStream, {
+                    toJSON() {
+                        return { headers: {} };
+                    },
+                });
+                callback(null, null, rawResponseStream);
+                setImmediate(() => {
+                    rawResponseStream.end();
+                });
+            };
+        });
+        mocha_1.it('should throw if both a range and validation is given', () => {
+            assert.throws(() => {
+                file.createReadStream({
+                    validation: true,
+                    start: 3,
+                    end: 8,
+                });
+            }, /Cannot use validation with file ranges \(start\/end\)\./);
+            assert.throws(() => {
+                file.createReadStream({
+                    validation: true,
+                    start: 3,
+                });
+            }, /Cannot use validation with file ranges \(start\/end\)\./);
+            assert.throws(() => {
+                file.createReadStream({
+                    validation: true,
+                    end: 8,
+                });
+            }, /Cannot use validation with file ranges \(start\/end\)\./);
+            assert.doesNotThrow(() => {
+                file.createReadStream({
+                    start: 3,
+                    end: 8,
+                });
+            });
+        });
+        mocha_1.it('should send query.generation if File has one', done => {
+            const versionedFile = new File(BUCKET, 'file.txt', { generation: 1 });
+            versionedFile.requestStream = (rOpts) => {
+                assert.strictEqual(rOpts.qs.generation, 1);
+                setImmediate(done);
+                return duplexify();
+            };
+            versionedFile.createReadStream().resume();
+        });
+        mocha_1.it('should send query.userProject if provided', done => {
+            const options = {
+                userProject: 'user-project-id',
+            };
+            file.requestStream = (rOpts) => {
+                assert.strictEqual(rOpts.qs.userProject, options.userProject);
+                setImmediate(done);
+                return duplexify();
+            };
+            file.createReadStream(options).resume();
+        });
+        mocha_1.describe('authenticating', () => {
+            mocha_1.it('should create an authenticated request', done => {
+                file.requestStream = (opts) => {
+                    assert.deepStrictEqual(opts, {
+                        forever: false,
+                        uri: '',
+                        headers: {
+                            'Accept-Encoding': 'gzip',
+                            'Cache-Control': 'no-store',
+                        },
+                        qs: {
+                            alt: 'media',
+                        },
+                    });
+                    setImmediate(() => {
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream().resume();
+            });
+            mocha_1.describe('errors', () => {
+                const ERROR = new Error('Error.');
+                mocha_1.beforeEach(() => {
+                    file.requestStream = () => {
+                        const requestStream = new stream_1.PassThrough();
+                        setImmediate(() => {
+                            requestStream.emit('error', ERROR);
+                        });
+                        return requestStream;
+                    };
+                });
+                mocha_1.it('should emit an error from authenticating', done => {
+                    file
+                        .createReadStream()
+                        .once('error', (err) => {
+                        assert.strictEqual(err, ERROR);
+                        done();
+                    })
+                        .resume();
+                });
+            });
+        });
+        mocha_1.describe('requestStream', () => {
+            mocha_1.it('should get readable stream from request', done => {
+                file.requestStream = () => {
+                    setImmediate(() => {
+                        done();
+                    });
+                    return new stream_1.PassThrough();
+                };
+                file.createReadStream().resume();
+            });
+            mocha_1.it('should emit response event from request', done => {
+                file.requestStream = getFakeSuccessfulRequest('body');
+                file
+                    .createReadStream({ validation: false })
+                    .on('response', () => {
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should let util.handleResp handle the response', done => {
+                const response = { a: 'b', c: 'd' };
+                handleRespOverride = (err, response_, body) => {
+                    assert.strictEqual(err, null);
+                    assert.strictEqual(response_, response);
+                    assert.strictEqual(body, null);
+                    done();
+                };
+                file.requestStream = () => {
+                    const rowRequestStream = new stream_1.PassThrough();
+                    setImmediate(() => {
+                        rowRequestStream.emit('response', response);
+                    });
+                    return rowRequestStream;
+                };
+                file.createReadStream().resume();
+            });
+            mocha_1.describe('errors', () => {
+                const ERROR = new Error('Error.');
+                mocha_1.beforeEach(() => {
+                    file.requestStream = getFakeFailedRequest(ERROR);
+                });
+                mocha_1.it('should emit the error', done => {
+                    file
+                        .createReadStream()
+                        .once('error', (err) => {
+                        assert.deepStrictEqual(err, ERROR);
+                        done();
+                    })
+                        .resume();
+                });
+                mocha_1.it('should parse a response stream for a better error', done => {
+                    const rawResponsePayload = 'error message from body';
+                    const rawResponseStream = new stream_1.PassThrough();
+                    const requestStream = new stream_1.PassThrough();
+                    handleRespOverride = (err, res, body, callback) => {
+                        callback(ERROR, null, res);
+                        setImmediate(() => {
+                            rawResponseStream.end(rawResponsePayload);
+                        });
+                    };
+                    file.requestStream = () => {
+                        setImmediate(() => {
+                            requestStream.emit('response', rawResponseStream);
+                        });
+                        return requestStream;
+                    };
+                    file
+                        .createReadStream()
+                        .once('error', (err) => {
+                        assert.strictEqual(err, ERROR);
+                        assert.strictEqual(err.message, rawResponsePayload);
+                        done();
+                    })
+                        .resume();
+                });
+                mocha_1.it('should emit errors from the request stream', done => {
+                    const error = new Error('Error.');
+                    const rawResponseStream = new stream_1.PassThrough();
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    rawResponseStream.toJSON = () => {
+                        return { headers: {} };
+                    };
+                    const requestStream = new stream_1.PassThrough();
+                    handleRespOverride = (err, res, body, callback) => {
+                        callback(null, null, rawResponseStream);
+                        setImmediate(() => {
+                            rawResponseStream.emit('error', error);
+                        });
+                    };
+                    file.requestStream = () => {
+                        setImmediate(() => {
+                            requestStream.emit('response', rawResponseStream);
+                        });
+                        return requestStream;
+                    };
+                    file
+                        .createReadStream()
+                        .on('error', (err) => {
+                        assert.strictEqual(err, error);
+                        done();
+                    })
+                        .resume();
+                });
+                mocha_1.it('should not handle both error and end events', done => {
+                    const error = new Error('Error.');
+                    const rawResponseStream = new stream_1.PassThrough();
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    rawResponseStream.toJSON = () => {
+                        return { headers: {} };
+                    };
+                    const requestStream = new stream_1.PassThrough();
+                    handleRespOverride = (err, res, body, callback) => {
+                        callback(null, null, rawResponseStream);
+                        setImmediate(() => {
+                            rawResponseStream.emit('error', error);
+                        });
+                    };
+                    file.requestStream = () => {
+                        setImmediate(() => {
+                            requestStream.emit('response', rawResponseStream);
+                        });
+                        return requestStream;
+                    };
+                    file.getMetadata = (options, callback) => {
+                        callback();
+                    };
+                    file
+                        .createReadStream({ validation: false })
+                        .on('error', (err) => {
+                        assert.strictEqual(err, error);
+                        rawResponseStream.emit('end');
+                        setImmediate(done);
+                    })
+                        .on('end', () => {
+                        done(new Error('Should not have been called.'));
+                    })
+                        .resume();
+                });
+            });
+        });
+        mocha_1.describe('compression', () => {
+            const DATA = 'test data';
+            const GZIPPED_DATA = zlib.gzipSync(DATA);
+            mocha_1.beforeEach(() => {
+                handleRespOverride = (err, res, body, callback) => {
+                    const rawResponseStream = new stream_1.PassThrough();
+                    Object.assign(rawResponseStream, {
+                        toJSON() {
+                            return {
+                                headers: {
+                                    'content-encoding': 'gzip',
+                                },
+                            };
+                        },
+                    });
+                    callback(null, null, rawResponseStream);
+                    setImmediate(() => {
+                        rawResponseStream.end(GZIPPED_DATA);
+                    });
+                };
+                file.requestStream = getFakeSuccessfulRequest(GZIPPED_DATA);
+            });
+            mocha_1.it('should gunzip the response', done => {
+                file
+                    .createReadStream()
+                    .once('error', done)
+                    .on('data', (data) => {
+                    assert.strictEqual(data.toString(), DATA);
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should not gunzip the response if "decompress: false" is passed', done => {
+                file
+                    .createReadStream({ decompress: false })
+                    .once('error', done)
+                    .on('data', (data) => {
+                    assert.strictEqual(data, GZIPPED_DATA);
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should emit errors from the gunzip stream', done => {
+                const error = new Error('Error.');
+                const createGunzipStream = new stream_1.PassThrough();
+                createGunzipOverride = () => {
+                    process.nextTick(() => {
+                        createGunzipStream.emit('error', error);
+                    });
+                    return createGunzipStream;
+                };
+                file
+                    .createReadStream()
+                    .on('error', (err) => {
+                    assert.strictEqual(err, error);
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should not handle both error and end events', done => {
+                const error = new Error('Error.');
+                const createGunzipStream = new stream_1.PassThrough();
+                createGunzipOverride = () => {
+                    process.nextTick(() => {
+                        createGunzipStream.emit('error', error);
+                    });
+                    return createGunzipStream;
+                };
+                file.getMetadata = (options, callback) => {
+                    callback();
+                };
+                file
+                    .createReadStream({ validation: false })
+                    .on('error', (err) => {
+                    assert.strictEqual(err, error);
+                    createGunzipStream.emit('end');
+                    setImmediate(done);
+                })
+                    .on('end', () => {
+                    done(new Error('Should not have been called.'));
+                })
+                    .resume();
+            });
+        });
+        mocha_1.describe('validation', () => {
+            const data = 'test';
+            let fakeValidationStream;
+            mocha_1.beforeEach(() => {
+                file.metadata.mediaLink = 'http://uri';
+                file.getMetadata = (options, callback) => {
+                    file.metadata = {
+                        crc32c: '####wA==',
+                        md5Hash: 'CY9rzUYh03PK3k6DJie09g==',
+                    };
+                    callback();
+                };
+                fakeValidationStream = Object.assign(new stream_1.PassThrough(), {
+                    test: () => true,
+                });
+                hashStreamValidationOverride = () => {
+                    return fakeValidationStream;
+                };
+            });
+            mocha_1.describe('server decompression', () => {
+                mocha_1.beforeEach(() => {
+                    handleRespOverride = (err, res, body, callback) => {
+                        const rawResponseStream = new stream_1.PassThrough();
+                        Object.assign(rawResponseStream, {
+                            toJSON() {
+                                return {
+                                    headers: {},
+                                };
+                            },
+                        });
+                        callback(null, null, rawResponseStream);
+                        setImmediate(() => {
+                            rawResponseStream.end(data);
+                        });
+                    };
+                    file.requestStream = getFakeSuccessfulRequest(data);
+                });
+                mocha_1.it('should skip validation if file was stored compressed', done => {
+                    const validateStub = sinon.stub().returns(true);
+                    fakeValidationStream.test = validateStub;
+                    file.getMetadata = (options, callback) => {
+                        file.metadata = {
+                            crc32c: '####wA==',
+                            md5Hash: 'CY9rzUYh03PK3k6DJie09g==',
+                            contentEncoding: 'gzip',
+                        };
+                        callback();
+                    };
+                    file
+                        .createReadStream({ validation: 'crc32c' })
+                        .on('error', done)
+                        .on('end', () => {
+                        assert(validateStub.notCalled);
+                        done();
+                    })
+                        .resume();
+                });
+            });
+            mocha_1.it('should emit errors from the validation stream', done => {
+                const error = new Error('Error.');
+                hashStreamValidationOverride = () => {
+                    setImmediate(() => {
+                        fakeValidationStream.emit('error', error);
+                    });
+                    return fakeValidationStream;
+                };
+                file.requestStream = getFakeSuccessfulRequest(data);
+                file
+                    .createReadStream()
+                    .on('error', (err) => {
+                    assert.strictEqual(err, error);
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should not handle both error and end events', done => {
+                const error = new Error('Error.');
+                hashStreamValidationOverride = () => {
+                    setImmediate(() => {
+                        fakeValidationStream.emit('error', error);
+                    });
+                    return fakeValidationStream;
+                };
+                file.requestStream = getFakeSuccessfulRequest(data);
+                file
+                    .createReadStream()
+                    .on('error', (err) => {
+                    assert.strictEqual(err, error);
+                    fakeValidationStream.emit('end');
+                    setImmediate(done);
+                })
+                    .on('end', () => {
+                    done(new Error('Should not have been called.'));
+                })
+                    .resume();
+            });
+            mocha_1.it('should pass the userProject to getMetadata', done => {
+                const fakeOptions = {
+                    userProject: 'grapce-spaceship-123',
+                };
+                file.getMetadata = (options) => {
+                    assert.strictEqual(options.userProject, fakeOptions.userProject);
+                    done();
+                };
+                file.requestStream = getFakeSuccessfulRequest(data);
+                file.createReadStream(fakeOptions).on('error', done).resume();
+            });
+            mocha_1.it('should destroy stream from failed metadata fetch', done => {
+                const error = new Error('Error.');
+                file.getMetadata = (options, callback) => {
+                    callback(error);
+                };
+                file.requestStream = getFakeSuccessfulRequest('data');
+                file
+                    .createReadStream()
+                    .on('error', (err) => {
+                    assert.strictEqual(err, error);
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should validate with crc32c', done => {
+                file.requestStream = getFakeSuccessfulRequest(data);
+                file
+                    .createReadStream({ validation: 'crc32c' })
+                    .on('error', done)
+                    .on('end', done)
+                    .resume();
+            });
+            mocha_1.it('should emit an error if crc32c validation fails', done => {
+                file.requestStream = getFakeSuccessfulRequest('bad-data');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                fakeValidationStream.test = () => false;
+                file
+                    .createReadStream({ validation: 'crc32c' })
+                    .on('error', (err) => {
+                    assert.strictEqual(err.code, 'CONTENT_DOWNLOAD_MISMATCH');
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should validate with md5', done => {
+                file.requestStream = getFakeSuccessfulRequest(data);
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                fakeValidationStream.test = () => true;
+                file
+                    .createReadStream({ validation: 'md5' })
+                    .on('error', done)
+                    .on('end', done)
+                    .resume();
+            });
+            mocha_1.it('should emit an error if md5 validation fails', done => {
+                file.requestStream = getFakeSuccessfulRequest('bad-data');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                fakeValidationStream.test = () => false;
+                file
+                    .createReadStream({ validation: 'md5' })
+                    .on('error', (err) => {
+                    assert.strictEqual(err.code, 'CONTENT_DOWNLOAD_MISMATCH');
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should default to crc32c validation', done => {
+                file.getMetadata = (options, callback) => {
+                    file.metadata = {
+                        crc32c: file.metadata.crc32c,
+                    };
+                    callback();
+                };
+                file.requestStream = getFakeSuccessfulRequest(data);
+                file
+                    .createReadStream()
+                    .on('error', (err) => {
+                    assert.strictEqual(err.code, 'CONTENT_DOWNLOAD_MISMATCH');
+                    done();
+                })
+                    .resume();
+            });
+            mocha_1.it('should ignore a data mismatch if validation: false', done => {
+                file.requestStream = getFakeSuccessfulRequest(data);
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                fakeValidationStream.test = () => false;
+                file
+                    .createReadStream({ validation: false })
+                    .resume()
+                    .on('error', done)
+                    .on('end', done);
+            });
+            mocha_1.describe('destroying the through stream', () => {
+                mocha_1.beforeEach(() => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    fakeValidationStream.test = () => false;
+                });
+                mocha_1.it('should destroy after failed validation', done => {
+                    file.requestStream = getFakeSuccessfulRequest('bad-data');
+                    const readStream = file.createReadStream({ validation: 'md5' });
+                    readStream.destroy = (err) => {
+                        assert.strictEqual(err.code, 'CONTENT_DOWNLOAD_MISMATCH');
+                        done();
+                    };
+                    readStream.resume();
+                });
+                mocha_1.it('should destroy if MD5 is requested but absent', done => {
+                    file.getMetadata = (options, callback) => {
+                        file.metadata = {
+                            crc32c: file.metadata.crc32c,
+                        };
+                        callback();
+                    };
+                    file.requestStream = getFakeSuccessfulRequest('bad-data');
+                    const readStream = file.createReadStream({ validation: 'md5' });
+                    readStream.destroy = (err) => {
+                        assert.strictEqual(err.code, 'MD5_NOT_AVAILABLE');
+                        done();
+                    };
+                    readStream.resume();
+                });
+            });
+        });
+        mocha_1.describe('range requests', () => {
+            mocha_1.it('should accept a start range', done => {
+                const startOffset = 100;
+                file.requestStream = (opts) => {
+                    setImmediate(() => {
+                        assert.strictEqual(opts.headers.Range, 'bytes=' + startOffset + '-');
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream({ start: startOffset }).resume();
+            });
+            mocha_1.it('should accept an end range and set start to 0', done => {
+                const endOffset = 100;
+                file.requestStream = (opts) => {
+                    setImmediate(() => {
+                        assert.strictEqual(opts.headers.Range, 'bytes=0-' + endOffset);
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream({ end: endOffset }).resume();
+            });
+            mocha_1.it('should accept both a start and end range', done => {
+                const startOffset = 100;
+                const endOffset = 101;
+                file.requestStream = (opts) => {
+                    setImmediate(() => {
+                        const expectedRange = 'bytes=' + startOffset + '-' + endOffset;
+                        assert.strictEqual(opts.headers.Range, expectedRange);
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream({ start: startOffset, end: endOffset }).resume();
+            });
+            mocha_1.it('should accept range start and end as 0', done => {
+                const startOffset = 0;
+                const endOffset = 0;
+                file.requestStream = (opts) => {
+                    setImmediate(() => {
+                        const expectedRange = 'bytes=0-0';
+                        assert.strictEqual(opts.headers.Range, expectedRange);
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream({ start: startOffset, end: endOffset }).resume();
+            });
+            mocha_1.it('should end the through stream', done => {
+                file.requestStream = getFakeSuccessfulRequest('body');
+                const readStream = file.createReadStream({ start: 100 });
+                readStream.end = done;
+                readStream.resume();
+            });
+        });
+        mocha_1.describe('tail requests', () => {
+            mocha_1.it('should make a request for the tail bytes', done => {
+                const endOffset = -10;
+                file.requestStream = (opts) => {
+                    setImmediate(() => {
+                        assert.strictEqual(opts.headers.Range, 'bytes=' + endOffset);
+                        done();
+                    });
+                    return duplexify();
+                };
+                file.createReadStream({ end: endOffset }).resume();
+            });
+        });
+    });
+    mocha_1.describe('createResumableUpload', () => {
+        mocha_1.it('should not require options', done => {
+            resumableUploadOverride = {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                createURI(opts, callback) {
+                    assert.strictEqual(opts.metadata, undefined);
+                    callback();
+                },
+            };
+            file.createResumableUpload(done);
+        });
+        mocha_1.it('should create a resumable upload URI', done => {
+            const options = {
+                configPath: '/Users/user/.config/here',
+                metadata: {
+                    contentType: 'application/json',
+                },
+                origin: '*',
+                predefinedAcl: 'predefined-acl',
+                private: 'private',
+                public: 'public',
+                userProject: 'user-project-id',
+            };
+            file.generation = 3;
+            file.encryptionKey = 'encryption-key';
+            file.kmsKeyName = 'kms-key-name';
+            resumableUploadOverride = {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                createURI(opts, callback) {
+                    const bucket = file.bucket;
+                    const storage = bucket.storage;
+                    assert.strictEqual(opts.authClient, storage.authClient);
+                    assert.strictEqual(opts.apiEndpoint, storage.apiEndpoint);
+                    assert.strictEqual(opts.bucket, bucket.name);
+                    assert.strictEqual(opts.configPath, options.configPath);
+                    assert.strictEqual(opts.file, file.name);
+                    assert.strictEqual(opts.generation, file.generation);
+                    assert.strictEqual(opts.key, file.encryptionKey);
+                    assert.strictEqual(opts.kmsKeyName, file.kmsKeyName);
+                    assert.strictEqual(opts.metadata, options.metadata);
+                    assert.strictEqual(opts.origin, options.origin);
+                    assert.strictEqual(opts.predefinedAcl, options.predefinedAcl);
+                    assert.strictEqual(opts.private, options.private);
+                    assert.strictEqual(opts.public, options.public);
+                    assert.strictEqual(opts.userProject, options.userProject);
+                    callback();
+                },
+            };
+            file.createResumableUpload(options, done);
+        });
+    });
+    mocha_1.describe('createWriteStream', () => {
+        const METADATA = { a: 'b', c: 'd' };
+        mocha_1.beforeEach(() => {
+            Object.assign(fakeFs, {
+                access(dir, check, callback) {
+                    // Assume that the required config directory is writable.
+                    callback();
+                },
+            });
+        });
+        mocha_1.it('should return a stream', () => {
+            assert(file.createWriteStream() instanceof stream_1.Stream);
+        });
+        mocha_1.it('should emit errors', done => {
+            const error = new Error('Error.');
+            const uploadStream = new stream_1.PassThrough();
+            file.startResumableUpload_ = (dup) => {
+                dup.setWritable(uploadStream);
+                uploadStream.emit('error', error);
+            };
+            const writable = file.createWriteStream();
+            writable.on('error', (err) => {
+                assert.strictEqual(err, error);
+                done();
+            });
+            writable.write('data');
+        });
+        mocha_1.it('should emit progress via resumable upload', done => {
+            const progress = {};
+            resumableUploadOverride = {
+                upload() {
+                    const uploadStream = new stream_1.PassThrough();
+                    setImmediate(() => {
+                        uploadStream.emit('progress', progress);
+                    });
+                    return uploadStream;
+                },
+            };
+            const writable = file.createWriteStream();
+            writable.on('progress', (evt) => {
+                assert.strictEqual(evt, progress);
+                done();
+            });
+            writable.write('data');
+        });
+        mocha_1.it('should emit progress via simple upload', done => {
+            const progress = {};
+            makeWritableStreamOverride = (dup) => {
+                const uploadStream = new stream_1.PassThrough();
+                uploadStream.on('progress', evt => dup.emit('progress', evt));
+                dup.setWritable(uploadStream);
+                setImmediate(() => {
+                    uploadStream.emit('progress', progress);
+                });
+            };
+            const writable = file.createWriteStream({ resumable: false });
+            writable.on('progress', (evt) => {
+                assert.strictEqual(evt, progress);
+                done();
+            });
+            writable.write('data');
+        });
+        mocha_1.it('should start a simple upload if specified', done => {
+            const options = {
+                metadata: METADATA,
+                resumable: false,
+                customValue: true,
+            };
+            const writable = file.createWriteStream(options);
+            file.startSimpleUpload_ = (stream, options_) => {
+                assert.deepStrictEqual(options_, options);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should start a resumable upload if configPath is provided', done => {
+            const options = {
+                metadata: METADATA,
+                configPath: '/config/path.json',
+            };
+            const writable = file.createWriteStream(options);
+            file.startResumableUpload_ = (stream, options_) => {
+                assert.deepStrictEqual(options_, options);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should start a resumable upload if specified', done => {
+            const options = {
+                metadata: METADATA,
+                resumable: true,
+                customValue: true,
+            };
+            const writable = file.createWriteStream(options);
+            file.startResumableUpload_ = (stream, options_) => {
+                assert.deepStrictEqual(options_, options);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should check if xdg-basedir is writable', done => {
+            const fakeDir = 'fake-xdg-dir';
+            xdgConfigOverride = fakeDir;
+            Object.assign(fakeFs, {
+                access(dir) {
+                    assert.strictEqual(dir, fakeDir);
+                    done();
+                },
+            });
+            file.createWriteStream({ resumable: true }).write('data');
+        });
+        mocha_1.it('should fall back to checking tmpdir', done => {
+            const fakeDir = 'fake-tmp-dir';
+            xdgConfigOverride = false;
+            fakeOs.tmpdir = () => {
+                return fakeDir;
+            };
+            Object.assign(fakeFs, {
+                access(dir) {
+                    assert.strictEqual(dir, fakeDir);
+                    done();
+                },
+            });
+            file.createWriteStream({ resumable: true }).write('data');
+        });
+        mocha_1.it('should fail if resumable requested but not writable', done => {
+            const error = new Error('Error.');
+            Object.assign(fakeFs, {
+                access(dir, check, callback) {
+                    callback(error);
+                },
+            });
+            const writable = file.createWriteStream({ resumable: true });
+            writable.on('error', (err) => {
+                assert.notStrictEqual(err, error);
+                assert.strictEqual(err.name, 'ResumableUploadError');
+                const configDir = xdgBasedirCached.config;
+                assert.strictEqual(err.message, [
+                    'A resumable upload could not be performed. The directory,',
+                    `${configDir}, is not writable. You may try another upload,`,
+                    'this time setting `options.resumable` to `false`.',
+                ].join(' '));
+                done();
+            });
+            writable.write('data');
+        });
+        mocha_1.it('should fall back to simple if not writable', done => {
+            const options = {
+                metadata: METADATA,
+                customValue: true,
+            };
+            file.startSimpleUpload_ = (stream, options_) => {
+                assert.deepStrictEqual(options_, options);
+                done();
+            };
+            Object.assign(fakeFs, {
+                access(dir, check, callback) {
+                    callback(new Error('Error.'));
+                },
+            });
+            file.createWriteStream(options).write('data');
+        });
+        mocha_1.it('should default to a resumable upload', done => {
+            const writable = file.createWriteStream({
+                metadata: METADATA,
+            });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.deepStrictEqual(options.metadata, METADATA);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should alias contentType to metadata object', done => {
+            const contentType = 'text/html';
+            const writable = file.createWriteStream({ contentType });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentType, contentType);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should detect contentType with contentType:auto', done => {
+            const writable = file.createWriteStream({ contentType: 'auto' });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentType, 'image/png');
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should detect contentType if not defined', done => {
+            const writable = file.createWriteStream();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentType, 'image/png');
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should not set a contentType if mime lookup failed', done => {
+            const file = new File('file-without-ext');
+            const writable = file.createWriteStream();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(typeof options.metadata.contentType, 'undefined');
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should set encoding with gzip:true', done => {
+            const writable = file.createWriteStream({ gzip: true });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentEncoding, 'gzip');
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should set encoding with gzip:auto & compressible', done => {
+            const writable = file.createWriteStream({
+                gzip: 'auto',
+                contentType: 'text/html',
+            });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentEncoding, 'gzip');
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should not set encoding with gzip:auto & non-compressible', done => {
+            const writable = file.createWriteStream({ gzip: 'auto' });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.startResumableUpload_ = (stream, options) => {
+                assert.strictEqual(options.metadata.contentEncoding, undefined);
+                done();
+            };
+            writable.write('data');
+        });
+        mocha_1.it('should re-emit response event', done => {
+            const writable = file.createWriteStream();
+            const resp = {};
+            file.startResumableUpload_ = (stream) => {
+                stream.emit('response', resp);
+            };
+            writable.on('response', (resp_) => {
+                assert.strictEqual(resp_, resp);
+                done();
+            });
+            writable.write('data');
+        });
+        mocha_1.it('should cork data on prefinish', done => {
+            const writable = file.createWriteStream({ resumable: false });
+            file.startSimpleUpload_ = (stream) => {
+                assert.strictEqual(writable._corked, 0);
+                stream.emit('prefinish');
+                assert.strictEqual(writable._corked, 1);
+                done();
+            };
+            writable.end('data');
+        });
+        mocha_1.describe('validation', () => {
+            const data = 'test';
+            const fakeMetadata = {
+                crc32c: { crc32c: '####wA==' },
+                md5: { md5Hash: 'CY9rzUYh03PK3k6DJie09g==' },
+            };
+            mocha_1.it('should uncork after successful write', done => {
+                const writable = file.createWriteStream({ validation: 'crc32c' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        assert.strictEqual(writable._corked, 1);
+                        file.metadata = fakeMetadata.crc32c;
+                        stream.emit('complete');
+                        assert.strictEqual(writable._corked, 0);
+                        done();
+                    });
+                };
+                writable.end(data);
+                writable.on('error', done);
+            });
+            mocha_1.it('should validate with crc32c', done => {
+                const writable = file.createWriteStream({ validation: 'crc32c' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = fakeMetadata.crc32c;
+                        stream.emit('complete');
+                    });
+                };
+                writable.end(data);
+                writable.on('error', done).on('finish', done);
+            });
+            mocha_1.it('should emit an error if crc32c validation fails', done => {
+                const writable = file.createWriteStream({ validation: 'crc32c' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = fakeMetadata.crc32c;
+                        stream.emit('complete');
+                    });
+                };
+                file.delete = (cb) => {
+                    cb();
+                };
+                writable.write('bad-data');
+                writable.end();
+                writable.on('error', (err) => {
+                    assert.strictEqual(err.code, 'FILE_NO_UPLOAD');
+                    done();
+                });
+            });
+            mocha_1.it('should validate with md5', done => {
+                const writable = file.createWriteStream({ validation: 'md5' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = fakeMetadata.md5;
+                        stream.emit('complete');
+                    });
+                };
+                writable.write(data);
+                writable.end();
+                writable.on('error', done).on('finish', done);
+            });
+            mocha_1.it('should emit an error if md5 validation fails', done => {
+                const writable = file.createWriteStream({ validation: 'md5' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = fakeMetadata.md5;
+                        stream.emit('complete');
+                    });
+                };
+                file.delete = (cb) => {
+                    cb();
+                };
+                writable.write('bad-data');
+                writable.end();
+                writable.on('error', (err) => {
+                    assert.strictEqual(err.code, 'FILE_NO_UPLOAD');
+                    done();
+                });
+            });
+            mocha_1.it('should default to md5 validation', done => {
+                const writable = file.createWriteStream();
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = { md5Hash: 'bad-hash' };
+                        stream.emit('complete');
+                    });
+                };
+                file.delete = (cb) => {
+                    cb();
+                };
+                writable.write(data);
+                writable.end();
+                writable.on('error', (err) => {
+                    assert.strictEqual(err.code, 'FILE_NO_UPLOAD');
+                    done();
+                });
+            });
+            mocha_1.it('should ignore a data mismatch if validation: false', done => {
+                const writable = file.createWriteStream({ validation: false });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = { md5Hash: 'bad-hash' };
+                        stream.emit('complete');
+                    });
+                };
+                writable.write(data);
+                writable.end();
+                writable.on('error', done);
+                writable.on('finish', done);
+            });
+            mocha_1.it('should delete the file if validation fails', done => {
+                const writable = file.createWriteStream();
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = { md5Hash: 'bad-hash' };
+                        stream.emit('complete');
+                    });
+                };
+                file.delete = () => {
+                    done();
+                };
+                writable.write(data);
+                writable.end();
+            });
+            mocha_1.it('should emit an error if MD5 is requested but absent', done => {
+                const writable = file.createWriteStream({ validation: 'md5' });
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = { crc32c: 'not-md5' };
+                        stream.emit('complete');
+                    });
+                };
+                file.delete = (cb) => {
+                    cb();
+                };
+                writable.write(data);
+                writable.end();
+                writable.on('error', (err) => {
+                    assert.strictEqual(err.code, 'MD5_NOT_AVAILABLE');
+                    done();
+                });
+            });
+            mocha_1.it('should emit a different error if delete fails', done => {
+                const writable = file.createWriteStream();
+                file.startResumableUpload_ = (stream) => {
+                    setImmediate(() => {
+                        file.metadata = { md5Hash: 'bad-hash' };
+                        stream.emit('complete');
+                    });
+                };
+                const deleteErrorMessage = 'Delete error message.';
+                const deleteError = new Error(deleteErrorMessage);
+                file.delete = (cb) => {
+                    cb(deleteError);
+                };
+                writable.write(data);
+                writable.end();
+                writable.on('error', (err) => {
+                    assert.strictEqual(err.code, 'FILE_NO_UPLOAD_DELETE');
+                    assert(err.message.indexOf(deleteErrorMessage) > -1);
+                    done();
+                });
+            });
+        });
+    });
+    mocha_1.describe('deleteResumableCache', () => {
+        mocha_1.it('should delete resumable file upload cache', done => {
+            file.generation = 123;
+            resumableUploadOverride = {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                upload(opts) {
+                    assert.strictEqual(opts.bucket, file.bucket.name);
+                    assert.strictEqual(opts.file, file.name);
+                    assert.strictEqual(opts.generation, file.generation);
+                    return {
+                        deleteConfig: () => {
+                            done();
+                        },
+                    };
+                },
+            };
+            file.deleteResumableCache();
+        });
+    });
+    mocha_1.describe('download', () => {
+        let fileReadStream;
+        mocha_1.beforeEach(() => {
+            fileReadStream = new stream_1.Readable();
+            fileReadStream._read = common_1.util.noop;
+            fileReadStream.on('end', () => {
+                fileReadStream.emit('complete');
+            });
+            file.createReadStream = () => {
+                return fileReadStream;
+            };
+        });
+        mocha_1.it('should accept just a callback', done => {
+            fileReadStream._read = () => {
+                done();
+            };
+            file.download(assert.ifError);
+        });
+        mocha_1.it('should accept an options object and callback', done => {
+            fileReadStream._read = () => {
+                done();
+            };
+            file.download({}, assert.ifError);
+        });
+        mocha_1.it('should pass the provided options to createReadStream', done => {
+            const readOptions = { start: 100, end: 200 };
+            file.createReadStream = (options) => {
+                assert.deepStrictEqual(options, readOptions);
+                done();
+                return fileReadStream;
+            };
+            file.download(readOptions, assert.ifError);
+        });
+        mocha_1.it('should only execute callback once', done => {
+            Object.assign(fileReadStream, {
+                _read() {
+                    this.emit('error', new Error('Error.'));
+                    this.emit('error', new Error('Error.'));
+                },
+            });
+            file.download(() => {
+                done();
+            });
+        });
+        mocha_1.describe('into memory', () => {
+            mocha_1.it('should buffer a file into memory if no destination', done => {
+                const fileContents = 'abcdefghijklmnopqrstuvwxyz';
+                Object.assign(fileReadStream, {
+                    _read() {
+                        this.push(fileContents);
+                        this.push(null);
+                    },
+                });
+                file.download((err, remoteFileContents) => {
+                    assert.ifError(err);
+                    assert.strictEqual(fileContents, remoteFileContents.toString());
+                    done();
+                });
+            });
+            mocha_1.it('should execute callback with error', done => {
+                const error = new Error('Error.');
+                Object.assign(fileReadStream, {
+                    _read() {
+                        this.emit('error', error);
+                    },
+                });
+                file.download((err) => {
+                    assert.strictEqual(err, error);
+                    done();
+                });
+            });
+        });
+        mocha_1.describe('with destination', () => {
+            mocha_1.it('should write the file to a destination if provided', done => {
+                tmp.setGracefulCleanup();
+                tmp.file((err, tmpFilePath) => {
+                    assert.ifError(err);
+                    const fileContents = 'abcdefghijklmnopqrstuvwxyz';
+                    Object.assign(fileReadStream, {
+                        _read() {
+                            this.push(fileContents);
+                            this.push(null);
+                        },
+                    });
+                    file.download({ destination: tmpFilePath }, (err) => {
+                        assert.ifError(err);
+                        fs.readFile(tmpFilePath, (err, tmpFileContents) => {
+                            assert.ifError(err);
+                            assert.strictEqual(fileContents, tmpFileContents.toString());
+                            done();
+                        });
+                    });
+                });
+            });
+            mocha_1.it('should execute callback with error', done => {
+                tmp.setGracefulCleanup();
+                tmp.file((err, tmpFilePath) => {
+                    assert.ifError(err);
+                    const error = new Error('Error.');
+                    Object.assign(fileReadStream, {
+                        _read() {
+                            this.emit('error', error);
+                        },
+                    });
+                    file.download({ destination: tmpFilePath }, (err) => {
+                        assert.strictEqual(err, error);
+                        done();
+                    });
+                });
+            });
+        });
+    });
+    mocha_1.describe('getExpirationDate', () => {
+        mocha_1.it('should refresh metadata', done => {
+            file.getMetadata = () => {
+                done();
+            };
+            file.getExpirationDate(assert.ifError);
+        });
+        mocha_1.it('should return error from getMetadata', done => {
+            const error = new Error('Error.');
+            const apiResponse = {};
+            file.getMetadata = (callback) => {
+                callback(error, null, apiResponse);
+            };
+            file.getExpirationDate((err, expirationDate, apiResponse_) => {
+                assert.strictEqual(err, error);
+                assert.strictEqual(expirationDate, null);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+        mocha_1.it('should return an error if there is no expiration time', done => {
+            const apiResponse = {};
+            file.getMetadata = (callback) => {
+                callback(null, {}, apiResponse);
+            };
+            file.getExpirationDate((err, expirationDate, apiResponse_) => {
+                assert.strictEqual(err.message, 'An expiration time is not available.');
+                assert.strictEqual(expirationDate, null);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+        mocha_1.it('should return the expiration time as a Date object', done => {
+            const expirationTime = new Date();
+            const apiResponse = {
+                retentionExpirationTime: expirationTime.toJSON(),
+            };
+            file.getMetadata = (callback) => {
+                callback(null, apiResponse, apiResponse);
+            };
+            file.getExpirationDate((err, expirationDate, apiResponse_) => {
+                assert.ifError(err);
+                assert.deepStrictEqual(expirationDate, expirationTime);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+    });
+    mocha_1.describe('getSignedPolicy', () => {
+        mocha_1.it('should alias to generateSignedPostPolicyV2', done => {
+            const options = {
+                expires: Date.now() + 2000,
+            };
+            const callback = () => { };
+            file.generateSignedPostPolicyV2 = (argOpts, argCb) => {
+                assert.strictEqual(argOpts, options);
+                assert.strictEqual(argCb, callback);
+                done();
+            };
+            file.getSignedPolicy(options, callback);
+        });
+    });
+    mocha_1.describe('generateSignedPostPolicyV2', () => {
+        let CONFIG;
+        mocha_1.beforeEach(() => {
+            CONFIG = {
+                expires: Date.now() + 2000,
+            };
+            BUCKET.storage.authClient = {
+                sign: () => {
+                    return Promise.resolve('signature');
+                },
+            };
+        });
+        mocha_1.it('should create a signed policy', done => {
+            BUCKET.storage.authClient.sign = (blobToSign) => {
+                const policy = Buffer.from(blobToSign, 'base64').toString();
+                assert.strictEqual(typeof JSON.parse(policy), 'object');
+                return Promise.resolve('signature');
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.generateSignedPostPolicyV2(CONFIG, (err, signedPolicy) => {
+                assert.ifError(err);
+                assert.strictEqual(typeof signedPolicy.string, 'string');
+                assert.strictEqual(typeof signedPolicy.base64, 'string');
+                assert.strictEqual(typeof signedPolicy.signature, 'string');
+                done();
+            });
+        });
+        mocha_1.it('should not modify the configuration object', done => {
+            const originalConfig = Object.assign({}, CONFIG);
+            file.generateSignedPostPolicyV2(CONFIG, (err) => {
+                assert.ifError(err);
+                assert.deepStrictEqual(CONFIG, originalConfig);
+                done();
+            });
+        });
+        mocha_1.it('should return an error if signBlob errors', done => {
+            const error = new Error('Error.');
+            BUCKET.storage.authClient.sign = () => {
+                return Promise.reject(error);
+            };
+            file.generateSignedPostPolicyV2(CONFIG, (err) => {
+                assert.strictEqual(err.name, 'SigningError');
+                assert.strictEqual(err.message, error.message);
+                done();
+            });
+        });
+        mocha_1.it('should add key equality condition', done => {
+            file.generateSignedPostPolicyV2(CONFIG, (err, signedPolicy) => {
+                const conditionString = '["eq","$key","' + file.name + '"]';
+                assert.ifError(err);
+                assert(signedPolicy.string.indexOf(conditionString) > -1);
+                done();
+            });
+        });
+        mocha_1.it('should add ACL condtion', done => {
+            file.generateSignedPostPolicyV2({
+                expires: Date.now() + 2000,
+                acl: '<acl>',
+            }, (err, signedPolicy) => {
+                const conditionString = '{"acl":"<acl>"}';
+                assert.ifError(err);
+                assert(signedPolicy.string.indexOf(conditionString) > -1);
+                done();
+            });
+        });
+        mocha_1.it('should add success redirect', done => {
+            const redirectUrl = 'http://redirect';
+            file.generateSignedPostPolicyV2({
+                expires: Date.now() + 2000,
+                successRedirect: redirectUrl,
+            }, (err, signedPolicy) => {
+                assert.ifError(err);
+                const policy = JSON.parse(signedPolicy.string);
+                assert(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                policy.conditions.some((condition) => {
+                    return condition.success_action_redirect === redirectUrl;
+                }));
+                done();
+            });
+        });
+        mocha_1.it('should add success status', done => {
+            const successStatus = '200';
+            file.generateSignedPostPolicyV2({
+                expires: Date.now() + 2000,
+                successStatus,
+            }, (err, signedPolicy) => {
+                assert.ifError(err);
+                const policy = JSON.parse(signedPolicy.string);
+                assert(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                policy.conditions.some((condition) => {
+                    return condition.success_action_status === successStatus;
+                }));
+                done();
+            });
+        });
+        mocha_1.describe('expires', () => {
+            mocha_1.it('should accept Date objects', done => {
+                const expires = new Date(Date.now() + 1000 * 60);
+                file.generateSignedPostPolicyV2({
+                    expires,
+                }, (err, policy) => {
+                    assert.ifError(err);
+                    const expires_ = JSON.parse(policy.string).expiration;
+                    assert.strictEqual(expires_, expires.toISOString());
+                    done();
+                });
+            });
+            mocha_1.it('should accept numbers', done => {
+                const expires = Date.now() + 1000 * 60;
+                file.generateSignedPostPolicyV2({
+                    expires,
+                }, (err, policy) => {
+                    assert.ifError(err);
+                    const expires_ = JSON.parse(policy.string).expiration;
+                    assert.strictEqual(expires_, new Date(expires).toISOString());
+                    done();
+                });
+            });
+            mocha_1.it('should accept strings', done => {
+                const expires = '12-12-2099';
+                file.generateSignedPostPolicyV2({
+                    expires,
+                }, (err, policy) => {
+                    assert.ifError(err);
+                    const expires_ = JSON.parse(policy.string).expiration;
+                    assert.strictEqual(expires_, new Date(expires).toISOString());
+                    done();
+                });
+            });
+            mocha_1.it('should throw if a date is invalid', () => {
+                const expires = new Date('31-12-2019');
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires,
+                    }, () => { });
+                }, /The expiration date provided was invalid\./);
+            });
+            mocha_1.it('should throw if a date from the past is given', () => {
+                const expires = Date.now() - 5;
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires,
+                    }, () => { });
+                }, /An expiration date cannot be in the past\./);
+            });
+        });
+        mocha_1.describe('equality condition', () => {
+            mocha_1.it('should add equality conditions (array of arrays)', done => {
+                file.generateSignedPostPolicyV2({
+                    expires: Date.now() + 2000,
+                    equals: [['$<field>', '<value>']],
+                }, (err, signedPolicy) => {
+                    const conditionString = '["eq","$<field>","<value>"]';
+                    assert.ifError(err);
+                    assert(signedPolicy.string.indexOf(conditionString) > -1);
+                    done();
+                });
+            });
+            mocha_1.it('should add equality condition (array)', done => {
+                file.generateSignedPostPolicyV2({
+                    expires: Date.now() + 2000,
+                    equals: ['$<field>', '<value>'],
+                }, (err, signedPolicy) => {
+                    const conditionString = '["eq","$<field>","<value>"]';
+                    assert.ifError(err);
+                    assert(signedPolicy.string.indexOf(conditionString) > -1);
+                    done();
+                });
+            });
+            mocha_1.it('should throw if equal condition is not an array', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        equals: [{}],
+                    }, () => { });
+                }, /Equals condition must be an array of 2 elements\./);
+            });
+            mocha_1.it('should throw if equal condition length is not 2', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        equals: [['1', '2', '3']],
+                    }, () => { });
+                }, /Equals condition must be an array of 2 elements\./);
+            });
+        });
+        mocha_1.describe('prefix conditions', () => {
+            mocha_1.it('should add prefix conditions (array of arrays)', done => {
+                file.generateSignedPostPolicyV2({
+                    expires: Date.now() + 2000,
+                    startsWith: [['$<field>', '<value>']],
+                }, (err, signedPolicy) => {
+                    const conditionString = '["starts-with","$<field>","<value>"]';
+                    assert.ifError(err);
+                    assert(signedPolicy.string.indexOf(conditionString) > -1);
+                    done();
+                });
+            });
+            mocha_1.it('should add prefix condition (array)', done => {
+                file.generateSignedPostPolicyV2({
+                    expires: Date.now() + 2000,
+                    startsWith: ['$<field>', '<value>'],
+                }, (err, signedPolicy) => {
+                    const conditionString = '["starts-with","$<field>","<value>"]';
+                    assert.ifError(err);
+                    assert(signedPolicy.string.indexOf(conditionString) > -1);
+                    done();
+                });
+            });
+            mocha_1.it('should throw if prexif condition is not an array', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        startsWith: [{}],
+                    }, () => { });
+                }, /StartsWith condition must be an array of 2 elements\./);
+            });
+            mocha_1.it('should throw if prefix condition length is not 2', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        startsWith: [['1', '2', '3']],
+                    }, () => { });
+                }, /StartsWith condition must be an array of 2 elements\./);
+            });
+        });
+        mocha_1.describe('content length', () => {
+            mocha_1.it('should add content length condition', done => {
+                file.generateSignedPostPolicyV2({
+                    expires: Date.now() + 2000,
+                    contentLengthRange: { min: 0, max: 1 },
+                }, (err, signedPolicy) => {
+                    const conditionString = '["content-length-range",0,1]';
+                    assert.ifError(err);
+                    assert(signedPolicy.string.indexOf(conditionString) > -1);
+                    done();
+                });
+            });
+            mocha_1.it('should throw if content length has no min', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        contentLengthRange: [{ max: 1 }],
+                    }, () => { });
+                }, /ContentLengthRange must have numeric min & max fields\./);
+            });
+            mocha_1.it('should throw if content length has no max', () => {
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV2({
+                        expires: Date.now() + 2000,
+                        contentLengthRange: [{ min: 0 }],
+                    }, () => { });
+                }, /ContentLengthRange must have numeric min & max fields\./);
+            });
+        });
+    });
+    mocha_1.describe('generateSignedPostPolicyV4', () => {
+        let CONFIG;
+        const NOW = new Date('2020-01-01');
+        const CLIENT_EMAIL = 'test@domain.com';
+        const SIGNATURE = 'signature';
+        let fakeTimer;
+        let sandbox;
+        mocha_1.beforeEach(() => {
+            sandbox = sinon.createSandbox();
+            fakeTimer = sinon.useFakeTimers(NOW);
+            CONFIG = {
+                expires: NOW.valueOf() + 2000,
+            };
+            BUCKET.storage.authClient = {
+                sign: sandbox.stub().resolves(SIGNATURE),
+                getCredentials: sandbox.stub().resolves({ client_email: CLIENT_EMAIL }),
+            };
+        });
+        mocha_1.afterEach(() => {
+            sandbox.restore();
+            fakeTimer.restore();
+        });
+        const fieldsToConditions = (fields) => Object.entries(fields).map(([k, v]) => ({ [k]: v }));
+        mocha_1.it('should create a signed policy', done => {
+            CONFIG.fields = {
+                'x-goog-meta-foo': 'bar',
+            };
+            const requiredFields = {
+                key: file.name,
+                'x-goog-date': '20200101T000000Z',
+                'x-goog-credential': `${CLIENT_EMAIL}/20200101/auto/storage/goog4_request`,
+                'x-goog-algorithm': 'GOOG4-RSA-SHA256',
+            };
+            const policy = {
+                conditions: [
+                    ...fieldsToConditions(CONFIG.fields),
+                    { bucket: BUCKET.name },
+                    ...fieldsToConditions(requiredFields),
+                ],
+                expiration: dateFormat.format(new Date(CONFIG.expires), 'YYYY-MM-DD[T]HH:mm:ss[Z]', true),
+            };
+            const policyString = JSON.stringify(policy);
+            const EXPECTED_POLICY = Buffer.from(policyString).toString('base64');
+            const EXPECTED_SIGNATURE = Buffer.from(SIGNATURE, 'base64').toString('hex');
+            const EXPECTED_FIELDS = {
+                ...CONFIG.fields,
+                ...requiredFields,
+                'x-goog-signature': EXPECTED_SIGNATURE,
+                policy: EXPECTED_POLICY,
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                assert(res.url, `${file_1.STORAGE_POST_POLICY_BASE_URL}/${BUCKET.name}`);
+                assert.deepStrictEqual(res.fields, EXPECTED_FIELDS);
+                const signStub = BUCKET.storage.authClient.sign;
+                assert.deepStrictEqual(Buffer.from(signStub.getCall(0).args[0], 'base64').toString(), policyString);
+                done();
+            });
+        });
+        mocha_1.it('should not modify the configuration object', done => {
+            const originalConfig = Object.assign({}, CONFIG);
+            file.generateSignedPostPolicyV4(CONFIG, (err) => {
+                assert.ifError(err);
+                assert.deepStrictEqual(CONFIG, originalConfig);
+                done();
+            });
+        });
+        mocha_1.it('should return an error if signBlob errors', done => {
+            const error = new Error('Error.');
+            BUCKET.storage.authClient.sign.rejects(error);
+            file.generateSignedPostPolicyV4(CONFIG, (err) => {
+                assert.strictEqual(err.name, 'SigningError');
+                assert.strictEqual(err.message, error.message);
+                done();
+            });
+        });
+        mocha_1.it('should add key condition', done => {
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                assert.strictEqual(res.fields['key'], file.name);
+                const EXPECTED_POLICY_ELEMENT = `{"key":"${file.name}"}`;
+                assert(Buffer.from(res.fields.policy, 'base64')
+                    .toString('utf-8')
+                    .includes(EXPECTED_POLICY_ELEMENT));
+                done();
+            });
+        });
+        mocha_1.it('should include fields in conditions', done => {
+            CONFIG = {
+                fields: {
+                    'x-goog-meta-foo': 'bar',
+                },
+                ...CONFIG,
+            };
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                const expectedConditionString = JSON.stringify(CONFIG.fields);
+                assert.strictEqual(res.fields['x-goog-meta-foo'], 'bar');
+                const decodedPolicy = Buffer.from(res.fields.policy, 'base64').toString('utf-8');
+                assert(decodedPolicy.includes(expectedConditionString));
+                done();
+            });
+        });
+        mocha_1.it('should encode special characters in policy', done => {
+            CONFIG = {
+                fields: {
+                    'x-goog-meta-foo': 'bår',
+                },
+                ...CONFIG,
+            };
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                assert.strictEqual(res.fields['x-goog-meta-foo'], 'bår');
+                const decodedPolicy = Buffer.from(res.fields.policy, 'base64').toString('utf-8');
+                assert(decodedPolicy.includes('"x-goog-meta-foo":"b\\u00e5r"'));
+                done();
+            });
+        });
+        mocha_1.it('should not include fields with x-ignore- prefix in conditions', done => {
+            CONFIG = {
+                fields: {
+                    'x-ignore-foo': 'bar',
+                },
+                ...CONFIG,
+            };
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                const expectedConditionString = JSON.stringify(CONFIG.fields);
+                assert.strictEqual(res.fields['x-ignore-foo'], 'bar');
+                const decodedPolicy = Buffer.from(res.fields.policy, 'base64').toString('utf-8');
+                assert(!decodedPolicy.includes(expectedConditionString));
+                const signStub = BUCKET.storage.authClient.sign;
+                assert(!signStub.getCall(0).args[0].includes('x-ignore-foo'));
+                done();
+            });
+        });
+        mocha_1.it('should accept conditions', done => {
+            CONFIG = {
+                conditions: [['starts-with', '$key', 'prefix-']],
+                ...CONFIG,
+            };
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                const expectedConditionString = JSON.stringify(CONFIG.conditions);
+                const decodedPolicy = Buffer.from(res.fields.policy, 'base64').toString('utf-8');
+                assert(decodedPolicy.includes(expectedConditionString));
+                const signStub = BUCKET.storage.authClient.sign;
+                assert(!signStub.getCall(0).args[0].includes(expectedConditionString));
+                done();
+            });
+        });
+        mocha_1.it('should output url with cname', done => {
+            CONFIG.bucketBoundHostname = 'http://domain.tld';
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                assert(res.url, CONFIG.bucketBoundHostname);
+                done();
+            });
+        });
+        mocha_1.it('should output a virtualHostedStyle url', done => {
+            CONFIG.virtualHostedStyle = true;
+            file.generateSignedPostPolicyV4(CONFIG, (err, res) => {
+                assert.ifError(err);
+                assert(res.url, `https://${BUCKET.name}.storage.googleapis.com/`);
+                done();
+            });
+        });
+        mocha_1.describe('expires', () => {
+            mocha_1.it('should accept Date objects', done => {
+                const expires = new Date(Date.now() + 1000 * 60);
+                file.generateSignedPostPolicyV4({
+                    expires,
+                }, (err, response) => {
+                    assert.ifError(err);
+                    const policy = JSON.parse(Buffer.from(response.fields.policy, 'base64').toString());
+                    assert.strictEqual(policy.expiration, dateFormat.format(expires, 'YYYY-MM-DD[T]HH:mm:ss[Z]', true));
+                    done();
+                });
+            });
+            mocha_1.it('should accept numbers', done => {
+                const expires = Date.now() + 1000 * 60;
+                file.generateSignedPostPolicyV4({
+                    expires,
+                }, (err, response) => {
+                    assert.ifError(err);
+                    const policy = JSON.parse(Buffer.from(response.fields.policy, 'base64').toString());
+                    assert.strictEqual(policy.expiration, dateFormat.format(new Date(expires), 'YYYY-MM-DD[T]HH:mm:ss[Z]', true));
+                    done();
+                });
+            });
+            mocha_1.it('should accept strings', done => {
+                const expires = dateFormat.format(new Date(Date.now() + 2 * 24 * 60 * 60 * 1000), 'YYYY-MM-DD', true);
+                file.generateSignedPostPolicyV4({
+                    expires,
+                }, (err, response) => {
+                    assert.ifError(err);
+                    const policy = JSON.parse(Buffer.from(response.fields.policy, 'base64').toString());
+                    assert.strictEqual(policy.expiration, dateFormat.format(new Date(expires), 'YYYY-MM-DD[T]HH:mm:ss[Z]', true));
+                    done();
+                });
+            });
+            mocha_1.it('should throw if a date is invalid', () => {
+                const expires = new Date('31-12-2019');
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV4({
+                        expires,
+                    }, () => { });
+                }, /The expiration date provided was invalid\./);
+            });
+            mocha_1.it('should throw if a date from the past is given', () => {
+                const expires = Date.now() - 5;
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV4({
+                        expires,
+                    }, () => { });
+                }, /An expiration date cannot be in the past\./);
+            });
+            mocha_1.it('should throw if a date beyond 7 days is given', () => {
+                const expires = Date.now() + 7.1 * 24 * 60 * 60 * 1000;
+                assert.throws(() => {
+                    file.generateSignedPostPolicyV4({
+                        expires,
+                    }, () => { });
+                }, { message: 'Max allowed expiration is seven days (604800 seconds).' });
+            });
+        });
+    });
+    mocha_1.describe('getSignedUrl', () => {
+        const EXPECTED_SIGNED_URL = 'signed-url';
+        const CNAME = 'https://www.example.com';
+        let sandbox;
+        let signer;
+        let signerGetSignedUrlStub;
+        let urlSignerStub;
+        let SIGNED_URL_CONFIG;
+        mocha_1.beforeEach(() => {
+            sandbox = sinon.createSandbox();
+            signerGetSignedUrlStub = sandbox.stub().resolves(EXPECTED_SIGNED_URL);
+            signer = {
+                getSignedUrl: signerGetSignedUrlStub,
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            urlSignerStub = sandbox.stub(fakeSigner, 'URLSigner').returns(signer);
+            SIGNED_URL_CONFIG = {
+                version: 'v4',
+                expires: new Date(),
+                action: 'read',
+                cname: CNAME,
+            };
+        });
+        mocha_1.afterEach(() => sandbox.restore());
+        mocha_1.it('should construct a URLSigner and call getSignedUrl', done => {
+            const accessibleAtDate = new Date();
+            const config = {
+                contentMd5: 'md5-hash',
+                contentType: 'application/json',
+                accessibleAt: accessibleAtDate,
+                virtualHostedStyle: true,
+                ...SIGNED_URL_CONFIG,
+            };
+            // assert signer is lazily-initialized.
+            assert.strictEqual(file.signer, undefined);
+            file.getSignedUrl(config, (err, signedUrl) => {
+                assert.ifError(err);
+                assert.strictEqual(file.signer, signer);
+                assert.strictEqual(signedUrl, EXPECTED_SIGNED_URL);
+                const ctorArgs = urlSignerStub.getCall(0).args;
+                assert.strictEqual(ctorArgs[0], file.storage.authClient);
+                assert.strictEqual(ctorArgs[1], file.bucket);
+                assert.strictEqual(ctorArgs[2], file);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0], {
+                    method: 'GET',
+                    version: 'v4',
+                    expires: config.expires,
+                    accessibleAt: accessibleAtDate,
+                    extensionHeaders: {},
+                    queryParams: {},
+                    contentMd5: config.contentMd5,
+                    contentType: config.contentType,
+                    cname: CNAME,
+                    virtualHostedStyle: true,
+                });
+                done();
+            });
+        });
+        mocha_1.it('should error if action is null', () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            SIGNED_URL_CONFIG.action = null;
+            assert.throws(() => {
+                file.getSignedUrl(SIGNED_URL_CONFIG, () => { });
+            }, /The action is not provided or invalid./);
+        });
+        mocha_1.it('should error if action is undefined', () => {
+            delete SIGNED_URL_CONFIG.action;
+            assert.throws(() => {
+                file.getSignedUrl(SIGNED_URL_CONFIG, () => { });
+            }, /The action is not provided or invalid./);
+        });
+        mocha_1.it('should error for an invalid action', () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            SIGNED_URL_CONFIG.action = 'watch';
+            assert.throws(() => {
+                file.getSignedUrl(SIGNED_URL_CONFIG, () => { });
+            }, /The action is not provided or invalid./);
+        });
+        mocha_1.it('should add "x-goog-resumable: start" header if action is resumable', done => {
+            SIGNED_URL_CONFIG.action = 'resumable';
+            SIGNED_URL_CONFIG.extensionHeaders = {
+                'another-header': 'value',
+            };
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.strictEqual(getSignedUrlArgs[0]['method'], 'POST');
+                assert.deepStrictEqual(getSignedUrlArgs[0]['extensionHeaders'], {
+                    'another-header': 'value',
+                    'x-goog-resumable': 'start',
+                });
+                done();
+            });
+        });
+        mocha_1.it('should add response-content-type query parameter', done => {
+            SIGNED_URL_CONFIG.responseType = 'application/json';
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0]['queryParams'], {
+                    'response-content-type': 'application/json',
+                });
+                done();
+            });
+        });
+        mocha_1.it('should respect promptSaveAs argument', done => {
+            const filename = 'fname.txt';
+            SIGNED_URL_CONFIG.promptSaveAs = filename;
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0]['queryParams'], {
+                    'response-content-disposition': 'attachment; filename="' + filename + '"',
+                });
+                done();
+            });
+        });
+        mocha_1.it('should add response-content-disposition query parameter', done => {
+            const disposition = 'attachment; filename="fname.ext"';
+            SIGNED_URL_CONFIG.responseDisposition = disposition;
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0]['queryParams'], {
+                    'response-content-disposition': disposition,
+                });
+                done();
+            });
+        });
+        mocha_1.it('should ignore promptSaveAs if set', done => {
+            const saveAs = 'fname2.ext';
+            const disposition = 'attachment; filename="fname.ext"';
+            SIGNED_URL_CONFIG.promptSaveAs = saveAs;
+            SIGNED_URL_CONFIG.responseDisposition = disposition;
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0]['queryParams'], {
+                    'response-content-disposition': disposition,
+                });
+                done();
+            });
+        });
+        mocha_1.it('should add generation to query parameter', done => {
+            file.generation = '246680131';
+            file.getSignedUrl(SIGNED_URL_CONFIG, (err) => {
+                assert.ifError(err);
+                const getSignedUrlArgs = signerGetSignedUrlStub.getCall(0).args;
+                assert.deepStrictEqual(getSignedUrlArgs[0]['queryParams'], {
+                    generation: file.generation,
+                });
+                done();
+            });
+        });
+    });
+    mocha_1.describe('makePrivate', () => {
+        mocha_1.it('should execute callback with API response', done => {
+            const apiResponse = {};
+            file.setMetadata = (metadata, query, callback) => {
+                callback(null, apiResponse);
+            };
+            file.makePrivate((err, apiResponse_) => {
+                assert.ifError(err);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+        mocha_1.it('should execute callback with error & API response', done => {
+            const error = new Error('Error.');
+            const apiResponse = {};
+            file.setMetadata = (metadata, query, callback) => {
+                callback(error, apiResponse);
+            };
+            file.makePrivate((err, apiResponse_) => {
+                assert.strictEqual(err, error);
+                assert.strictEqual(apiResponse_, apiResponse);
+                done();
+            });
+        });
+        mocha_1.it('should make the file private to project by default', done => {
+            file.setMetadata = (metadata, query) => {
+                assert.deepStrictEqual(metadata, { acl: null });
+                assert.deepStrictEqual(query, { predefinedAcl: 'projectPrivate' });
+                done();
+            };
+            file.makePrivate(common_1.util.noop);
+        });
+        mocha_1.it('should make the file private to user if strict = true', done => {
+            file.setMetadata = (metadata, query) => {
+                assert.deepStrictEqual(query, { predefinedAcl: 'private' });
+                done();
+            };
+            file.makePrivate({ strict: true }, common_1.util.noop);
+        });
+        mocha_1.it('should accept metadata', done => {
+            const options = {
+                metadata: { a: 'b', c: 'd' },
+            };
+            file.setMetadata = (metadata) => {
+                assert.deepStrictEqual(metadata, {
+                    acl: null,
+                    ...options.metadata,
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                assert.strictEqual(typeof options.metadata.acl, 'undefined');
+                done();
+            };
+            file.makePrivate(options, assert.ifError);
+        });
+        mocha_1.it('should accept userProject', done => {
+            const options = {
+                userProject: 'user-project-id',
+            };
+            file.setMetadata = (metadata, query) => {
+                assert.strictEqual(query.userProject, options.userProject);
+                done();
+            };
+            file.makePrivate(options, assert.ifError);
+        });
+    });
+    mocha_1.describe('makePublic', () => {
+        mocha_1.it('should execute callback', done => {
+            file.acl.add = (options, callback) => {
+                callback();
+            };
+            file.makePublic(done);
+        });
+        mocha_1.it('should make the file public', done => {
+            file.acl.add = (options) => {
+                assert.deepStrictEqual(options, { entity: 'allUsers', role: 'READER' });
+                done();
+            };
+            file.makePublic(common_1.util.noop);
+        });
+    });
+    mocha_1.describe('publicUrl', () => {
+        mocha_1.it('should return the public URL', done => {
+            const NAME = 'file-name';
+            const file = new File(BUCKET, NAME);
+            assert.strictEqual(file.publicUrl(), `https://storage.googleapis.com/bucket-name/${NAME}`);
+            done();
+        });
+        mocha_1.it('with slash in the name', done => {
+            const NAME = 'parent/child';
+            const file = new File(BUCKET, NAME);
+            assert.strictEqual(file.publicUrl(), `https://storage.googleapis.com/bucket-name/${NAME}`);
+            done();
+        });
+        mocha_1.it('with tilde in the name', done => {
+            const NAME = 'foo~bar';
+            const file = new File(BUCKET, NAME);
+            assert.strictEqual(file.publicUrl(), `https://storage.googleapis.com/bucket-name/${NAME}`);
+            done();
+        });
+        mocha_1.it('with non ascii in the name', done => {
+            const NAME = '\u2603';
+            const file = new File(BUCKET, NAME);
+            assert.strictEqual(file.publicUrl(), `https://storage.googleapis.com/bucket-name/${NAME}`);
+            done();
+        });
+    });
+    mocha_1.describe('isPublic', () => {
+        const sandbox = sinon.createSandbox();
+        mocha_1.afterEach(() => sandbox.restore());
+        mocha_1.it('should execute callback with `true` in response', done => {
+            sandbox.stub(gaxios, 'request').resolves();
+            file.isPublic((err, resp) => {
+                assert.ifError(err);
+                assert.strictEqual(resp, true);
+                done();
+            });
+        });
+        mocha_1.it('should execute callback with `false` in response', done => {
+            sandbox.stub(gaxios, 'request').rejects({ code: '403' });
+            file.isPublic((err, resp) => {
+                assert.ifError(err);
+                assert.strictEqual(resp, false);
+                done();
+            });
+        });
+        mocha_1.it('should propagate non-403 errors to user', done => {
+            const error = { code: '400' };
+            sandbox.stub(gaxios, 'request').rejects(error);
+            file.isPublic((err) => {
+                assert.strictEqual(err, error);
+                done();
+            });
+        });
+        mocha_1.it('should correctly send a HEAD request', done => {
+            const spy = sandbox.spy(gaxios, 'request');
+            file.isPublic((err) => {
+                assert.ifError(err);
+                assert.strictEqual(spy.calledWithMatch({ method: 'HEAD' }), true);
+                done();
+            });
+        });
+        mocha_1.it('should correctly format URL in the request', done => {
+            file = new File(BUCKET, 'my#file$.png');
+            const expecterURL = `http://${BUCKET.name}.storage.googleapis.com/${encodeURIComponent(file.name)}`;
+            const spy = sandbox.spy(gaxios, 'request');
+            file.isPublic((err) => {
+                assert.ifError(err);
+                assert.strictEqual(spy.calledWithMatch({ url: expecterURL }), true);
+                done();
+            });
+        });
+    });
+    mocha_1.describe('move', () => {
+        mocha_1.describe('copy to destination', () => {
+            function assertCopyFile(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file, expectedDestination, callback) {
+                file.copy = (destination) => {
+                    assert.strictEqual(destination, expectedDestination);
+                    callback();
+                };
+            }
+            mocha_1.it('should call copy with string', done => {
+                const newFileName = 'new-file-name.png';
+                assertCopyFile(file, newFileName, done);
+                file.move(newFileName);
+            });
+            mocha_1.it('should call copy with Bucket', done => {
+                assertCopyFile(file, BUCKET, done);
+                file.move(BUCKET);
+            });
+            mocha_1.it('should call copy with File', done => {
+                const newFile = new File(BUCKET, 'new-file');
+                assertCopyFile(file, newFile, done);
+                file.move(newFile);
+            });
+            mocha_1.it('should accept an options object', done => {
+                const newFile = new File(BUCKET, 'name');
+                const options = {};
+                file.copy = (destination, options_) => {
+                    assert.strictEqual(options_, options);
+                    done();
+                };
+                file.move(newFile, options, assert.ifError);
+            });
+            mocha_1.it('should fail if copy fails', done => {
+                const originalErrorMessage = 'Original error message.';
+                const error = new Error(originalErrorMessage);
+                file.copy = (destination, options, callback) => {
+                    callback(error);
+                };
+                file.move('new-filename', (err) => {
+                    assert.strictEqual(err, error);
+                    assert.strictEqual(err.message, `file#copy failed with an error - ${originalErrorMessage}`);
+                    done();
+                });
+            });
+        });
+        mocha_1.describe('delete original file', () => {
+            mocha_1.it('should call the callback with destinationFile and copyApiResponse', done => {
+                const copyApiResponse = {};
+                const newFile = new File(BUCKET, 'new-filename');
+                file.copy = (destination, options, callback) => {
+                    callback(null, newFile, copyApiResponse);
+                };
+                file.delete = (_, callback) => {
+                    callback();
+                };
+                file.move('new-filename', (err, destinationFile, apiResponse) => {
+                    assert.ifError(err);
+                    assert.strictEqual(destinationFile, newFile);
+                    assert.strictEqual(apiResponse, copyApiResponse);
+                    done();
+                });
+            });
+            mocha_1.it('should delete if copy is successful', done => {
+                const destinationFile = { bucket: {} };
+                file.copy = (destination, options, callback) => {
+                    callback(null, destinationFile);
+                };
+                Object.assign(file, {
+                    delete() {
+                        assert.strictEqual(this, file);
+                        done();
+                    },
+                });
+                file.move('new-filename');
+            });
+            mocha_1.it('should not delete if copy fails', done => {
+                let deleteCalled = false;
+                file.copy = (destination, options, callback) => {
+                    callback(new Error('Error.'));
+                };
+                file.delete = () => {
+                    deleteCalled = true;
+                };
+                file.move('new-filename', () => {
+                    assert.strictEqual(deleteCalled, false);
+                    done();
+                });
+            });
+            mocha_1.it('should not delete the destination is same as origin', done => {
+                file.request = (config, callback) => {
+                    callback(null, {});
+                };
+                const stub = sinon.stub(file, 'delete');
+                // destination is same bucket as object
+                file.move(BUCKET, (err) => {
+                    assert.ifError(err);
+                    // destination is same file as object
+                    file.move(file, (err) => {
+                        assert.ifError(err);
+                        // destination is same file name as string
+                        file.move(file.name, (err) => {
+                            assert.ifError(err);
+                            assert.ok(stub.notCalled);
+                            stub.reset();
+                            done();
+                        });
+                    });
+                });
+            });
+            mocha_1.it('should pass options to delete', done => {
+                const options = {};
+                const destinationFile = { bucket: {} };
+                file.copy = (destination, options, callback) => {
+                    callback(null, destinationFile);
+                };
+                file.delete = (options_) => {
+                    assert.strictEqual(options_, options);
+                    done();
+                };
+                file.move('new-filename', options, assert.ifError);
+            });
+            mocha_1.it('should fail if delete fails', done => {
+                const originalErrorMessage = 'Original error message.';
+                const error = new Error(originalErrorMessage);
+                const destinationFile = { bucket: {} };
+                file.copy = (destination, options, callback) => {
+                    callback(null, destinationFile);
+                };
+                file.delete = (options, callback) => {
+                    callback(error);
+                };
+                file.move('new-filename', (err) => {
+                    assert.strictEqual(err, error);
+                    assert.strictEqual(err.message, `file#delete failed with an error - ${originalErrorMessage}`);
+                    done();
+                });
+            });
+        });
+    });
+    mocha_1.describe('rename', () => {
+        mocha_1.it('should correctly call File#move', done => {
+            const newFileName = 'renamed-file.txt';
+            const options = {};
+            file.move = (dest, opts, cb) => {
+                assert.strictEqual(dest, newFileName);
+                assert.strictEqual(opts, options);
+                assert.strictEqual(cb, done);
+                cb();
+            };
+            file.rename(newFileName, options, done);
+        });
+        mocha_1.it('should accept File object', done => {
+            const newFileObject = new File(BUCKET, 'renamed-file.txt');
+            const options = {};
+            file.move = (dest, opts, cb) => {
+                assert.strictEqual(dest, newFileObject);
+                assert.strictEqual(opts, options);
+                assert.strictEqual(cb, done);
+                cb();
+            };
+            file.rename(newFileObject, options, done);
+        });
+        mocha_1.it('should not require options', done => {
+            file.move = (dest, opts, cb) => {
+                assert.deepStrictEqual(opts, {});
+                cb();
+            };
+            file.rename('new-name', done);
+        });
+    });
+    mocha_1.describe('request', () => {
+        mocha_1.it('should call the parent request function', () => {
+            const options = {};
+            const callback = () => { };
+            const expectedReturnValue = {};
+            file.parent.request = function (reqOpts, callback_) {
+                assert.strictEqual(this, file);
+                assert.strictEqual(reqOpts, options);
+                assert.strictEqual(callback_, callback);
+                return expectedReturnValue;
+            };
+            const returnedValue = file.request(options, callback);
+            assert.strictEqual(returnedValue, expectedReturnValue);
+        });
+    });
+    mocha_1.describe('rotateEncryptionKey', () => {
+        mocha_1.it('should create new File correctly', done => {
+            const options = {};
+            file.bucket.file = (id, options_) => {
+                assert.strictEqual(id, file.id);
+                assert.strictEqual(options_, options);
+                done();
+            };
+            file.rotateEncryptionKey(options, assert.ifError);
+        });
+        mocha_1.it('should default to customer-supplied encryption key', done => {
+            const encryptionKey = 'encryption-key';
+            file.bucket.file = (id, options) => {
+                assert.strictEqual(options.encryptionKey, encryptionKey);
+                done();
+            };
+            file.rotateEncryptionKey(encryptionKey, assert.ifError);
+        });
+        mocha_1.it('should accept a Buffer for customer-supplied encryption key', done => {
+            const encryptionKey = crypto.randomBytes(32);
+            file.bucket.file = (id, options) => {
+                assert.strictEqual(options.encryptionKey, encryptionKey);
+                done();
+            };
+            file.rotateEncryptionKey(encryptionKey, assert.ifError);
+        });
+        mocha_1.it('should call copy correctly', done => {
+            const newFile = {};
+            file.bucket.file = () => {
+                return newFile;
+            };
+            file.copy = (destination, callback) => {
+                assert.strictEqual(destination, newFile);
+                callback(); // done()
+            };
+            file.rotateEncryptionKey({}, done);
+        });
+    });
+    mocha_1.describe('save', () => {
+        const DATA = 'Data!';
+        const BUFFER_DATA = Buffer.from(DATA, 'utf8');
+        class DelayedStreamNoError extends stream_1.Transform {
+            _transform(chunk, _encoding, done) {
+                this.push(chunk);
+                setTimeout(() => {
+                    done();
+                }, 5);
+            }
+        }
+        class DelayedStream500Error extends stream_1.Transform {
+            constructor(retryCount) {
+                super();
+                this.retryCount = retryCount;
+            }
+            _transform(chunk, _encoding, done) {
+                this.push(chunk);
+                setTimeout(() => {
+                    if (this.retryCount === 1) {
+                        done(new HTTPError('first error', 500));
+                    }
+                    else {
+                        done();
+                    }
+                }, 5);
+            }
+        }
+        mocha_1.describe('retry mulipart upload', () => {
+            mocha_1.it('should save a string with no errors', async () => {
+                const options = { resumable: false };
+                file.createWriteStream = () => {
+                    return new DelayedStreamNoError();
+                };
+                await file.save(DATA, options, assert.ifError);
+            });
+            mocha_1.it('string upload should retry on first failure', async () => {
+                const options = { resumable: false };
+                let retryCount = 0;
+                file.createWriteStream = () => {
+                    retryCount++;
+                    return new DelayedStream500Error(retryCount);
+                };
+                await file.save(DATA, options);
+                assert.ok(retryCount === 2);
+            });
+            mocha_1.it('string upload should not retry if nonretryable error code', async () => {
+                const options = { resumable: false };
+                let retryCount = 0;
+                file.createWriteStream = () => {
+                    class DelayedStream403Error extends stream_1.Transform {
+                        _transform(chunk, _encoding, done) {
+                            this.push(chunk);
+                            setTimeout(() => {
+                                retryCount++;
+                                if (retryCount === 1) {
+                                    done(new HTTPError('first error', 403));
+                                }
+                                else {
+                                    done();
+                                }
+                            }, 5);
+                        }
+                    }
+                    return new DelayedStream403Error();
+                };
+                try {
+                    await file.save(DATA, options);
+                    throw Error('unreachable');
+                }
+                catch (e) {
+                    assert.strictEqual(e.message, 'first error');
+                }
+            });
+            mocha_1.it('should save a buffer with no errors', async () => {
+                const options = { resumable: false };
+                file.createWriteStream = () => {
+                    return new DelayedStreamNoError();
+                };
+                await file.save(DATA, options, assert.ifError);
+            });
+            mocha_1.it('buffer upload should retry on first failure', async () => {
+                const options = { resumable: false };
+                let retryCount = 0;
+                file.createWriteStream = () => {
+                    retryCount++;
+                    return new DelayedStream500Error(retryCount);
+                };
+                await file.save(BUFFER_DATA, options);
+                assert.ok(retryCount === 2);
+            });
+            mocha_1.it('non-multipart upload should not retry', async () => {
+                const options = { resumable: true };
+                let retryCount = 0;
+                file.createWriteStream = () => {
+                    retryCount++;
+                    return new DelayedStream500Error(retryCount);
+                };
+                try {
+                    await file.save(DATA, options);
+                    throw Error('unreachable');
+                }
+                catch (e) {
+                    assert.strictEqual(e.message, 'first error');
+                }
+            });
+        });
+        mocha_1.it('should execute callback', async () => {
+            const options = { resumable: true };
+            let retryCount = 0;
+            file.createWriteStream = () => {
+                retryCount++;
+                return new DelayedStream500Error(retryCount);
+            };
+            file.save(DATA, options, (err) => {
+                assert.strictEqual(err.code, 500);
+            });
+        });
+        mocha_1.it('should accept an options object', done => {
+            const options = {};
+            file.createWriteStream = (options_) => {
+                assert.strictEqual(options_, options);
+                setImmediate(done);
+                return new stream_1.PassThrough();
+            };
+            file.save(DATA, options, assert.ifError);
+        });
+        mocha_1.it('should not require options', done => {
+            file.createWriteStream = (options_) => {
+                assert.deepStrictEqual(options_, {});
+                setImmediate(done);
+                return new stream_1.PassThrough();
+            };
+            file.save(DATA, assert.ifError);
+        });
+        mocha_1.it('should register the error listener', done => {
+            file.createWriteStream = () => {
+                const writeStream = new stream_1.PassThrough();
+                writeStream.on('error', done);
+                setImmediate(() => {
+                    writeStream.emit('error');
+                });
+                return writeStream;
+            };
+            file.save(DATA, assert.ifError);
+        });
+        mocha_1.it('should register the finish listener', done => {
+            file.createWriteStream = () => {
+                const writeStream = new stream_1.PassThrough();
+                writeStream.once('finish', done);
+                return writeStream;
+            };
+            file.save(DATA, assert.ifError);
+        });
+        mocha_1.it('should register the progress listener if onUploadProgress is passed', done => {
+            const onUploadProgress = common_1.util.noop;
+            file.createWriteStream = () => {
+                const writeStream = new stream_1.PassThrough();
+                setImmediate(() => {
+                    const [listener] = writeStream.listeners('progress');
+                    assert.strictEqual(listener, onUploadProgress);
+                    done();
+                });
+                return writeStream;
+            };
+            file.save(DATA, { onUploadProgress }, assert.ifError);
+        });
+        mocha_1.it('should write the data', done => {
+            file.createWriteStream = () => {
+                const writeStream = new stream_1.PassThrough();
+                writeStream.on('data', data => {
+                    assert.strictEqual(data.toString(), DATA);
+                    done();
+                });
+                return writeStream;
+            };
+            file.save(DATA, assert.ifError);
+        });
+    });
+    mocha_1.describe('setStorageClass', () => {
+        const STORAGE_CLASS = 'new_storage_class';
+        mocha_1.it('should make the correct copy request', done => {
+            file.copy = (newFile, options) => {
+                assert.strictEqual(newFile, file);
+                assert.deepStrictEqual(options, {
+                    storageClass: STORAGE_CLASS.toUpperCase(),
+                });
+                done();
+            };
+            file.setStorageClass(STORAGE_CLASS, assert.ifError);
+        });
+        mocha_1.it('should accept options', done => {
+            const options = {
+                a: 'b',
+                c: 'd',
+            };
+            const expectedOptions = {
+                a: 'b',
+                c: 'd',
+                storageClass: STORAGE_CLASS.toUpperCase(),
+            };
+            file.copy = (newFile, options) => {
+                assert.deepStrictEqual(options, expectedOptions);
+                done();
+            };
+            file.setStorageClass(STORAGE_CLASS, options, assert.ifError);
+        });
+        mocha_1.it('should convert camelCase to snake_case', done => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.copy = (newFile, options) => {
+                assert.strictEqual(options.storageClass, 'CAMEL_CASE');
+                done();
+            };
+            file.setStorageClass('camelCase', assert.ifError);
+        });
+        mocha_1.it('should convert hyphenate to snake_case', done => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            file.copy = (newFile, options) => {
+                assert.strictEqual(options.storageClass, 'HYPHENATED_CLASS');
+                done();
+            };
+            file.setStorageClass('hyphenated-class', assert.ifError);
+        });
+        mocha_1.describe('error', () => {
+            const ERROR = new Error('Error.');
+            const API_RESPONSE = {};
+            mocha_1.beforeEach(() => {
+                file.copy = (newFile, options, callback) => {
+                    callback(ERROR, null, API_RESPONSE);
+                };
+            });
+            mocha_1.it('should execute callback with error & API response', done => {
+                file.setStorageClass(STORAGE_CLASS, (err, apiResponse) => {
+                    assert.strictEqual(err, ERROR);
+                    assert.strictEqual(apiResponse, API_RESPONSE);
+                    done();
+                });
+            });
+        });
+        mocha_1.describe('success', () => {
+            const METADATA = {};
+            const COPIED_FILE = {
+                metadata: METADATA,
+            };
+            const API_RESPONSE = {};
+            mocha_1.beforeEach(() => {
+                file.copy = (newFile, options, callback) => {
+                    callback(null, COPIED_FILE, API_RESPONSE);
+                };
+            });
+            mocha_1.it('should update the metadata on the file', done => {
+                file.setStorageClass(STORAGE_CLASS, (err) => {
+                    assert.ifError(err);
+                    assert.strictEqual(file.metadata, METADATA);
+                    done();
+                });
+            });
+            mocha_1.it('should execute callback with api response', done => {
+                file.setStorageClass(STORAGE_CLASS, (err, apiResponse) => {
+                    assert.ifError(err);
+                    assert.strictEqual(apiResponse, API_RESPONSE);
+                    done();
+                });
+            });
+        });
+    });
+    mocha_1.describe('setEncryptionKey', () => {
+        const KEY = crypto.randomBytes(32);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const KEY_BASE64 = Buffer.from(KEY).toString('base64');
+        const KEY_HASH = crypto
+            .createHash('sha256')
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            .update(KEY_BASE64, 'base64')
+            .digest('base64');
+        let _file;
+        mocha_1.beforeEach(() => {
+            _file = file.setEncryptionKey(KEY);
+        });
+        mocha_1.it('should localize the key', () => {
+            assert.strictEqual(file.encryptionKey, KEY);
+        });
+        mocha_1.it('should localize the base64 key', () => {
+            assert.strictEqual(file.encryptionKeyBase64, KEY_BASE64);
+        });
+        mocha_1.it('should localize the hash', () => {
+            assert.strictEqual(file.encryptionKeyHash, KEY_HASH);
+        });
+        mocha_1.it('should return the file instance', () => {
+            assert.strictEqual(_file, file);
+        });
+        mocha_1.it('should push the correct request interceptor', done => {
+            const expectedInterceptor = {
+                headers: {
+                    'x-goog-encryption-algorithm': 'AES256',
+                    'x-goog-encryption-key': KEY_BASE64,
+                    'x-goog-encryption-key-sha256': KEY_HASH,
+                },
+            };
+            assert.deepStrictEqual(file.interceptors[0].request({}), expectedInterceptor);
+            assert.deepStrictEqual(file.encryptionKeyInterceptor.request({}), expectedInterceptor);
+            done();
+        });
+    });
+    mocha_1.describe('startResumableUpload_', () => {
+        mocha_1.beforeEach(() => {
+            file.getRequestInterceptors = () => [];
+        });
+        mocha_1.describe('starting', () => {
+            mocha_1.it('should start a resumable upload', done => {
+                const options = {
+                    configPath: '/Users/user/.config/here',
+                    metadata: {},
+                    offset: 1234,
+                    public: true,
+                    private: false,
+                    predefinedAcl: 'allUsers',
+                    uri: 'http://resumable-uri',
+                    userProject: 'user-project-id',
+                };
+                file.generation = 3;
+                file.encryptionKey = 'key';
+                file.kmsKeyName = 'kms-key-name';
+                const customRequestInterceptors = [
+                    (reqOpts) => {
+                        reqOpts.headers = Object.assign({}, reqOpts.headers, {
+                            a: 'b',
+                        });
+                        return reqOpts;
+                    },
+                    (reqOpts) => {
+                        reqOpts.headers = Object.assign({}, reqOpts.headers, {
+                            c: 'd',
+                        });
+                        return reqOpts;
+                    },
+                ];
+                file.getRequestInterceptors = () => {
+                    return customRequestInterceptors;
+                };
+                resumableUploadOverride = {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    upload(opts) {
+                        const bucket = file.bucket;
+                        const storage = bucket.storage;
+                        const authClient = storage.makeAuthenticatedRequest.authClient;
+                        assert.strictEqual(opts.authClient, authClient);
+                        assert.strictEqual(opts.apiEndpoint, storage.apiEndpoint);
+                        assert.strictEqual(opts.bucket, bucket.name);
+                        assert.strictEqual(opts.configPath, options.configPath);
+                        assert.deepStrictEqual(opts.customRequestOptions, {
+                            headers: {
+                                a: 'b',
+                                c: 'd',
+                            },
+                        });
+                        assert.strictEqual(opts.file, file.name);
+                        assert.strictEqual(opts.generation, file.generation);
+                        assert.strictEqual(opts.key, file.encryptionKey);
+                        assert.strictEqual(opts.metadata, options.metadata);
+                        assert.strictEqual(opts.offset, options.offset);
+                        assert.strictEqual(opts.predefinedAcl, options.predefinedAcl);
+                        assert.strictEqual(opts.private, options.private);
+                        assert.strictEqual(opts.public, options.public);
+                        assert.strictEqual(opts.uri, options.uri);
+                        assert.strictEqual(opts.userProject, options.userProject);
+                        setImmediate(done);
+                        return new stream_1.PassThrough();
+                    },
+                };
+                file.startResumableUpload_(duplexify(), options);
+            });
+            mocha_1.it('should emit the response', done => {
+                const resp = {};
+                const uploadStream = new stream_1.PassThrough();
+                resumableUploadOverride = {
+                    upload() {
+                        setImmediate(() => {
+                            uploadStream.emit('response', resp);
+                        });
+                        return uploadStream;
+                    },
+                };
+                uploadStream.on('response', resp_ => {
+                    assert.strictEqual(resp_, resp);
+                    done();
+                });
+                file.startResumableUpload_(duplexify());
+            });
+            mocha_1.it('should set the metadata from the metadata event', done => {
+                const metadata = {};
+                const uploadStream = new stream_1.PassThrough();
+                resumableUploadOverride = {
+                    upload() {
+                        setImmediate(() => {
+                            uploadStream.emit('metadata', metadata);
+                            setImmediate(() => {
+                                assert.strictEqual(file.metadata, metadata);
+                                done();
+                            });
+                        });
+                        return uploadStream;
+                    },
+                };
+                file.startResumableUpload_(duplexify());
+            });
+            mocha_1.it('should emit complete after the stream finishes', done => {
+                const dup = duplexify();
+                dup.on('complete', done);
+                resumableUploadOverride = {
+                    upload() {
+                        const uploadStream = new stream_1.Transform();
+                        setImmediate(() => {
+                            uploadStream.end();
+                        });
+                        return uploadStream;
+                    },
+                };
+                file.startResumableUpload_(dup);
+            });
+            mocha_1.it('should set the writable stream', done => {
+                const dup = duplexify();
+                const uploadStream = new stream_1.PassThrough();
+                dup.setWritable = (stream) => {
+                    assert.strictEqual(stream, uploadStream);
+                    done();
+                };
+                resumableUploadOverride = {
+                    upload() {
+                        return uploadStream;
+                    },
+                };
+                file.startResumableUpload_(dup);
+            });
+            mocha_1.it('should emit progress event', done => {
+                const progress = {};
+                const dup = duplexify();
+                dup.on('progress', evt => {
+                    assert.strictEqual(evt, progress);
+                    done();
+                });
+                resumableUploadOverride = {
+                    upload() {
+                        const uploadStream = new stream_1.Transform();
+                        setImmediate(() => {
+                            uploadStream.emit('progress', progress);
+                        });
+                        return uploadStream;
+                    },
+                };
+                file.startResumableUpload_(dup);
+            });
+        });
+    });
+    mocha_1.describe('startSimpleUpload_', () => {
+        mocha_1.it('should get a writable stream', done => {
+            makeWritableStreamOverride = () => {
+                done();
+            };
+            file.startSimpleUpload_(duplexify());
+        });
+        mocha_1.it('should pass the required arguments', done => {
+            const options = {
+                metadata: {},
+                predefinedAcl: 'allUsers',
+                private: true,
+                public: true,
+                timeout: 99,
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options_) => {
+                assert.strictEqual(options_.metadata, options.metadata);
+                assert.deepStrictEqual(options_.request, {
+                    qs: {
+                        name: file.name,
+                        predefinedAcl: options.predefinedAcl,
+                    },
+                    timeout: options.timeout,
+                    uri: 'https://storage.googleapis.com/upload/storage/v1/b/' +
+                        file.bucket.name +
+                        '/o',
+                });
+                done();
+            };
+            file.startSimpleUpload_(duplexify(), options);
+        });
+        mocha_1.it('should set predefinedAcl when public: true', done => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options_) => {
+                assert.strictEqual(options_.request.qs.predefinedAcl, 'publicRead');
+                done();
+            };
+            file.startSimpleUpload_(duplexify(), { public: true });
+        });
+        mocha_1.it('should set predefinedAcl when private: true', done => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options_) => {
+                assert.strictEqual(options_.request.qs.predefinedAcl, 'private');
+                done();
+            };
+            file.startSimpleUpload_(duplexify(), { private: true });
+        });
+        mocha_1.it('should send query.ifGenerationMatch if File has one', done => {
+            const versionedFile = new File(BUCKET, 'new-file.txt', { generation: 1 });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options) => {
+                assert.strictEqual(options.request.qs.ifGenerationMatch, 1);
+                done();
+            };
+            versionedFile.startSimpleUpload_(duplexify(), {});
+        });
+        mocha_1.it('should send query.kmsKeyName if File has one', done => {
+            file.kmsKeyName = 'kms-key-name';
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options) => {
+                assert.strictEqual(options.request.qs.kmsKeyName, file.kmsKeyName);
+                done();
+            };
+            file.startSimpleUpload_(duplexify(), {});
+        });
+        mocha_1.it('should send userProject if set', done => {
+            const options = {
+                userProject: 'user-project-id',
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            makeWritableStreamOverride = (stream, options_) => {
+                assert.strictEqual(options_.request.qs.userProject, options.userProject);
+                done();
+            };
+            file.startSimpleUpload_(duplexify(), options);
+        });
+        mocha_1.describe('request', () => {
+            mocha_1.describe('error', () => {
+                const error = new Error('Error.');
+                mocha_1.beforeEach(() => {
+                    file.request = (reqOpts, callback) => {
+                        callback(error);
+                    };
+                });
+                mocha_1.it('should destroy the stream', done => {
+                    const stream = duplexify();
+                    file.startSimpleUpload_(stream);
+                    stream.on('error', (err) => {
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        assert.strictEqual(stream.destroyed, true);
+                        assert.strictEqual(err, error);
+                        done();
+                    });
+                });
+            });
+            mocha_1.describe('success', () => {
+                const body = {};
+                const resp = {};
+                mocha_1.beforeEach(() => {
+                    file.request = (reqOpts, callback) => {
+                        callback(null, body, resp);
+                    };
+                });
+                mocha_1.it('should set the metadata', () => {
+                    const stream = duplexify();
+                    file.startSimpleUpload_(stream);
+                    assert.strictEqual(file.metadata, body);
+                });
+                mocha_1.it('should emit the response', done => {
+                    const stream = duplexify();
+                    stream.on('response', resp_ => {
+                        assert.strictEqual(resp_, resp);
+                        done();
+                    });
+                    file.startSimpleUpload_(stream);
+                });
+                mocha_1.it('should emit complete', done => {
+                    const stream = duplexify();
+                    stream.on('complete', done);
+                    file.startSimpleUpload_(stream);
+                });
+            });
+        });
+    });
+    mocha_1.describe('setUserProject', () => {
+        mocha_1.it('should call the parent setUserProject function', done => {
+            const userProject = 'grape-spaceship-123';
+            file.parent.setUserProject = function (userProject_) {
+                assert.strictEqual(this, file);
+                assert.strictEqual(userProject_, userProject);
+                done();
+            };
+            file.setUserProject(userProject);
+        });
+    });
+});
+//# sourceMappingURL=file.js.map
